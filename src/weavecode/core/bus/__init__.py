@@ -1,3 +1,4 @@
+from weavecode.core.bus.commands import Command, PingCommand, PongResult
 from weavecode.core.bus.envelope import (
     INTERNAL_ERROR,
     INVALID_PARAMS,
@@ -10,8 +11,37 @@ from weavecode.core.bus.envelope import (
     JsonRpcSuccess,
     make_error,
 )
+from weavecode.core.bus.events import (
+    CoreStartedEvent,
+    Event,
+    LlmModelSelectedEvent,
+    LlmTokenEvent,
+    LlmUsageEvent,
+    LogLineEvent,
+    RunFinishedEvent,
+    RunStartedEvent,
+    StepFinishedEvent,
+    StepStartedEvent,
+    ToolCallFailedEvent,
+    ToolCallFinishedEvent,
+    ToolCallStartedEvent,
+)
 
 __all__ = [
+    "Command",
+    "CoreStartedEvent",
+    "Event",
+    "LogLineEvent",
+    "LlmModelSelectedEvent",
+    "LlmTokenEvent",
+    "LlmUsageEvent",
+    "RunFinishedEvent",
+    "RunStartedEvent",
+    "StepFinishedEvent",
+    "StepStartedEvent",
+    "ToolCallFailedEvent",
+    "ToolCallFinishedEvent",
+    "ToolCallStartedEvent",
     "INTERNAL_ERROR",
     "INVALID_PARAMS",
     "INVALID_REQUEST",
@@ -21,5 +51,7 @@ __all__ = [
     "JsonRpcSuccess",
     "METHOD_NOT_FOUND",
     "PARSE_ERROR",
+    "PingCommand",
+    "PongResult",
     "make_error",
 ]

@@ -12,6 +12,11 @@ class JsonRpcRequest(BaseModel):
     params: dict[str, Any] = Field(default_factory=dict)
 
 
+class EventPushEnvelope(BaseModel):
+    kind: Literal["event"] = "event"
+    event: dict[str, Any]  # Event.model_dump() 的序列化结果
+
+
 class JsonRpcSuccess(BaseModel):
     jsonrpc: Literal["2.0"] = "2.0"
     id: str
@@ -21,6 +26,7 @@ class JsonRpcSuccess(BaseModel):
 class JsonRpcErrorObject(BaseModel):
     code: int
     message: str
+    data: Any = None
 
 
 class JsonRpcError(BaseModel):
@@ -36,6 +42,15 @@ INVALID_PARAMS = -32602   # 参数错误
 INTERNAL_ERROR = -32603   # 服务器内部错误
 
 
+class HandlerError(Exception):
+    """命令 handler 抛出此异常，SocketServer 将其转换为结构化 JSON-RPC 错误响应。"""
+
+    def __init__(self, code: int, message: str, data: Any = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.data = data
+
+
 # 构造一个 JSON-RPC 错误响应对象
-def make_error(id: str | None, code: int, message: str) -> JsonRpcError:
-    return JsonRpcError(id=id, error=JsonRpcErrorObject(code=code, message=message))
+def make_error(id: str | None, code: int, message: str, data: Any = None) -> JsonRpcError:
+    return JsonRpcError(id=id, error=JsonRpcErrorObject(code=code, message=message, data=data))
