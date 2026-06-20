@@ -7,6 +7,10 @@ from dataclasses import dataclass, field
 class UsageStats:
     input_tokens: int
     output_tokens: int
+    # 命中 prompt caching 的输入 token，用来观察缓存断点是否生效
+    cache_read_input_tokens: int = 0
+    # 本次请求新建缓存写入的输入 token
+    cache_creation_input_tokens: int = 0
 
 
 @dataclass

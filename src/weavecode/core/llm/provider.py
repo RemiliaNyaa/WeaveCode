@@ -41,16 +41,32 @@ class AnthropicProvider:
     async def chat(
         self,
         messages: list[dict[str, object]],
+        tool_schemas: list[dict[str, object]],
         bus: EventBus,
         run_id: str,
         *,
         step: int = 0,
+        system: str | None = None,
     ) -> LlmResponse:
         await bus.publish(
             LlmModelSelectedEvent(run_id=run_id, model=self._model, strategy="static", ts=_now())
         )
 
-        system_blocks: list[dict[str, object]] = [{"type": "text", "text": _SYSTEM_PROMPT}]
+        # system 文本打上缓存断点：一次 run 里前缀不变，第二步起就能命中缓存
+        system_blocks: list[dict[str, object]] = [
+            {
+                "type": "text",
+                "text": system or _SYSTEM_PROMPT,
+                "cache_control": {"type": "ephemeral"},
+            },
+        ]
+
+        # 工具 schema 随请求注入；断点加在最后一项，整个工具列表作为一个缓存前缀
+        tools: list[dict[str, object]] = list(tool_schemas)
+        if tools:
+            last = dict(tools[-1])
+            last["cache_control"] = {"type": "ephemeral"}
+            tools = tools[:-1] + [last]
 
         kwargs: dict[str, object] = {
             "model": self._model,
@@ -58,6 +74,8 @@ class AnthropicProvider:
             "system": system_blocks,
             "messages": messages,
         }
+        if tools:
+            kwargs["tools"] = tools
 
         text_parts: list[str] = []
         async with self._client.messages.stream(**kwargs) as stream:
@@ -67,11 +85,16 @@ class AnthropicProvider:
             final_message = await stream.get_final_message()
 
         usage = final_message.usage
+        cache_read: int = getattr(usage, "cache_read_input_tokens", 0) or 0
+        cache_create: int = getattr(usage, "cache_creation_input_tokens", 0) or 0
+
         await bus.publish(
             LlmUsageEvent(
                 run_id=run_id,
                 input_tokens=usage.input_tokens,
                 output_tokens=usage.output_tokens,
+                cache_read_input_tokens=cache_read,
+                cache_creation_input_tokens=cache_create,
                 ts=_now(),
             )
         )
@@ -97,5 +120,7 @@ class AnthropicProvider:
             usage=UsageStats(
                 input_tokens=usage.input_tokens,
                 output_tokens=usage.output_tokens,
+                cache_read_input_tokens=cache_read,
+                cache_creation_input_tokens=cache_create,
             ),
         )

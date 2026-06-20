@@ -3,6 +3,16 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+# 工具使用说明：静态文本，拼在基础段之后一起构成可缓存的前缀
+_TOOL_USAGE = (
+    "## Tools\n"
+    "- Prefer the dedicated file tools over shell commands when reading or writing "
+    "files; bash is for running system commands.\n"
+    "- Give every tool call one clear purpose, and look at its result before the "
+    "next step.\n"
+    "- Pass absolute paths to file tools whenever the target location is known.\n"
+)
+
 
 @dataclass
 class ExecutionContext:
@@ -26,9 +36,12 @@ class ExecutionContext:
         elif not self.messages:
             self.messages.append({"role": "user", "content": self.goal})
 
-    # 返回本次运行的 system prompt：目前只拼基础段
+    # 返回本次运行的 system prompt：基础段 + 工具使用说明
+    # 静态文本排在前面、动态内容排在后面，稳定的前缀才能吃到 prompt caching
     def system_prompt(self, base: str) -> str:
-        return base
+        parts = [base]
+        parts.append("\n\n" + _TOOL_USAGE)
+        return "".join(parts)
 
     # 将 LLM 响应的 content blocks 追加为 assistant 消息
     def add_assistant_message(self, content: list[Any]) -> None:
