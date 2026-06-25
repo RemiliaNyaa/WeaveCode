@@ -4,13 +4,15 @@ import asyncio
 import json
 import sys
 import time
+from pathlib import Path
 from typing import Any
 
 from weavecode.core.config import WeaveConfig
+from weavecode.core.transport.socket_client import IpcError, SocketClient
 
 
-# 接收 dict 格式的事件并将运行进度格式化打印到终端
 class StdoutPrinter:
+    # 接收 dict 格式的事件并将运行进度格式化打印到终端
     def __init__(self) -> None:
         self._inline = False  # True while LLM tokens are mid-line
         self._run_start: float = 0.0
@@ -22,7 +24,7 @@ class StdoutPrinter:
             self._inline = False
 
     # 根据事件 type 字段分发并格式化打印到 stdout/stderr
-    def handle(self, event: dict[str, Any]) -> None:
+    async def handle(self, event: dict[str, Any]) -> None:
         t = event.get("type", "")
 
         if t == "run.started":
@@ -61,74 +63,54 @@ class StdoutPrinter:
             print(f"[run] {event.get('status', '')}  {event.get('steps')} steps  {elapsed:.1f}s")
 
 
-# 按 JSON-RPC 外壳写一行请求
-async def _send(
-    writer: asyncio.StreamWriter, req_id: str, method: str, params: dict[str, Any]
-) -> None:
-    payload = {"jsonrpc": "2.0", "id": req_id, "method": method, "params": params}
-    writer.write((json.dumps(payload, ensure_ascii=False) + "\n").encode())
-    await writer.drain()
-
-
-# 同一条连接上既有事件推送也有命令响应，按外壳分流后返回 (kind, payload)
-def _decode(raw: dict[str, Any]) -> tuple[str, Any]:
-    if raw.get("kind") == "event":
-        return "event", raw.get("event") or {}
-    if "error" in raw:
-        return "error", raw["error"]
-    return "result", raw.get("result")
-
-
-# 异步核心：连接 daemon，订阅事件，触发 run，等 run.finished
+# 异步核心：连接 daemon，订阅事件，触发 run，等待 run.finished
 async def _run_async(goal: str, config: WeaveConfig) -> int:
+    client = SocketClient(config.host, config.port)
     try:
-        reader, writer = await asyncio.open_connection(config.host, config.port)
+        await client.connect()
     except (ConnectionRefusedError, OSError):
         print(f"error: core not running ({config.host}:{config.port})", file=sys.stderr)
         return 1
 
     printer = StdoutPrinter()
+    finished = asyncio.Event()
     exit_code = 0
 
-    try:
-        await _send(
-            writer,
-            "cli-sub",
-            "event.subscribe",
-            {"topics": ["run.*", "step.*", "tool.*", "llm.token"], "scope": "global"},
-        )
-        await _send(writer, "cli-run", "agent.run", {"goal": goal})
-
-        while True:
-            line = await reader.readline()
-            if not line:
-                break
-            try:
-                raw = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(raw, dict):
-                continue
-
-            kind, payload = _decode(raw)
-            if kind == "error":
-                code = payload.get("code") if isinstance(payload, dict) else None
-                message = payload.get("message") if isinstance(payload, dict) else payload
-                print(f"error: {code} {message}", file=sys.stderr)
+    async def on_event(event: dict[str, Any]) -> None:
+        nonlocal exit_code
+        await printer.handle(event)
+        if event.get("type") == "run.finished":
+            if event.get("status") != "success":
                 exit_code = 1
-                break
-            if kind != "event" or not isinstance(payload, dict):
-                continue
+            finished.set()
 
-            printer.handle(payload)
-            if payload.get("type") == "run.finished":
-                if payload.get("status") != "success":
-                    exit_code = 1
-                break
-    finally:
-        writer.close()
-        await writer.wait_closed()
+    client.on_event(on_event)
+    loop_task = asyncio.create_task(client.run_event_loop())
 
+    try:
+        await client.send_command(
+            "event.subscribe",
+            {
+                "topics": ["run.*", "step.*", "tool.*", "llm.token", "llm.usage"],
+                "scope": "global",
+            },
+        )
+        await client.send_command("agent.run", {"goal": goal, "cwd": str(Path.cwd())})
+    except IpcError as e:
+        print(f"error: {e}", file=sys.stderr)
+        loop_task.cancel()
+        await client.close()
+        return 1
+
+    await finished.wait()
+
+    loop_task.cancel()
+    try:
+        await loop_task
+    except asyncio.CancelledError:
+        pass
+
+    await client.close()
     return exit_code
 
 
