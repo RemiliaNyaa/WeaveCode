@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import fnmatch
+import json
 import logging
 import signal
 import sys
@@ -9,13 +11,21 @@ import time
 from typing import Any
 
 import weavecode
-from weavecode.core.bus.commands import PongResult
-from weavecode.core.bus.envelope import INVALID_PARAMS, HandlerError
+from weavecode.core.bus.commands import (
+    AgentRunCommand,
+    AgentRunResult,
+    EventSubscribeCommand,
+    EventSubscribeResult,
+    PongResult,
+)
+from weavecode.core.bus.envelope import EventPushEnvelope
 from weavecode.core.config import WeaveConfig, get_config
+from weavecode.core.events.bus import EventBus
 from weavecode.core.logging_setup import setup_logging
 from weavecode.core.runner import AgentRunner
-from weavecode.core.runs import new_run_id
-from weavecode.core.transport.socket_server import SocketServer
+from weavecode.core.runs import events_file, new_run_id
+from weavecode.core.transport.ipc_broadcaster import IpcEventBroadcaster
+from weavecode.core.transport.socket_server import SocketServer, get_connection_writer
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +33,11 @@ logger = logging.getLogger(__name__)
 class CoreApp:
     def __init__(self) -> None:
         self._start_time = time.monotonic()
+        self._bus = EventBus()
+        self._broadcaster = IpcEventBroadcaster()
+        self._bus.subscribe(self._broadcaster.handle)   # broadcaster 挂到总线
         self._config: WeaveConfig | None = None
+        self._current_run_task: asyncio.Task[None] | None = None
 
     # 处理 core.ping 请求，返回服务版本、运行时长和接收时间
     async def _ping_handler(self, params: dict[str, Any]) -> PongResult:
@@ -35,15 +49,58 @@ class CoreApp:
             received_at=datetime.datetime.now(datetime.UTC).isoformat(),
         )
 
-    # 启动一次 agent run：校验目标后在守护进程内跑完整个任务，返回本次 run 标识
-    async def _agent_run_handler(self, params: dict[str, Any]) -> dict[str, str]:
-        goal = str(params.get("goal", "")).strip()
-        if not goal:
-            raise HandlerError(INVALID_PARAMS, "goal is required")
+    # 启动一次 agent run：异步创建 AgentRunner 并立即返回 run_id
+    async def _agent_run_handler(self, params: dict[str, Any]) -> AgentRunResult:
+        cmd = AgentRunCommand.model_validate(params)
+
+        if self._current_run_task and not self._current_run_task.done():
+            raise RuntimeError("a run is already in progress")
+
         run_id = new_run_id()
-        runner = AgentRunner(self._config)
-        await runner.run(goal, run_id=run_id)
-        return {"run_id": run_id}
+        runner = AgentRunner(self._config, bus=self._bus)
+        self._current_run_task = asyncio.create_task(
+            runner.run(cmd.goal, run_id=run_id)   # 后台运行，不等它完成
+        )
+        return AgentRunResult(run_id=run_id)
+
+    # 注册客户端事件订阅，可选先回放某 run 的历史事件再接收实时流
+    async def _subscribe_handler(self, params: dict[str, Any]) -> EventSubscribeResult:
+        cmd = EventSubscribeCommand.model_validate(params)
+        writer = get_connection_writer()
+
+        replayed_count = 0
+        if cmd.replay_from_run is not None:
+            replayed_count = await self._replay_events(
+                cmd.replay_from_run, writer, cmd.topics
+            )
+
+        sub_id = self._broadcaster.subscribe(writer, cmd.topics, cmd.scope)
+        return EventSubscribeResult(subscription_id=sub_id, replayed_count=replayed_count)
+
+    # 从事件文件向 writer 回放匹配 topic 的历史事件，返回已回放条数
+    async def _replay_events(
+        self,
+        run_id: str,
+        writer: asyncio.StreamWriter,
+        topics: list[str],
+    ) -> int:
+        path = events_file(run_id)
+        if not path.exists():
+            return 0
+
+        count = 0
+        for line in path.read_text().splitlines():
+            event = json.loads(line)
+            event_type = str(event.get("type", ""))
+            if not any(fnmatch.fnmatch(event_type, p) for p in topics):
+                continue
+            envelope = EventPushEnvelope(event=event)
+            writer.write(envelope.model_dump_json().encode() + b"\n")
+            count += 1
+
+        if count:
+            await writer.drain()
+        return count
 
     # 启动守护进程：加载配置、初始化日志、启动 TCP 服务器，并等待退出信号
     async def run(self) -> None:
@@ -51,9 +108,14 @@ class CoreApp:
         self._config = get_config()
         setup_logging(self._config)
 
-        server = SocketServer(self._config.host, self._config.port)
+        server = SocketServer(
+            self._config.host,
+            self._config.port,
+            self._broadcaster,
+        )
         server.register("core.ping", self._ping_handler)
         server.register("agent.run", self._agent_run_handler)
+        server.register("event.subscribe", self._subscribe_handler)
 
         addr = await server.start()
         logger.info("weave-core %s listening addr=%s", weavecode.__version__, addr)
@@ -72,6 +134,9 @@ class CoreApp:
         await shutdown.wait()
 
         logger.info("shutting down")
+        if self._current_run_task and not self._current_run_task.done():
+            self._current_run_task.cancel()
+            await asyncio.gather(self._current_run_task, return_exceptions=True)
         await server.stop()
 
 

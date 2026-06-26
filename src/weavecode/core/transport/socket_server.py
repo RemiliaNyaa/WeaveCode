@@ -4,7 +4,8 @@ import asyncio
 import json
 import logging
 from collections.abc import Awaitable, Callable
-from typing import TYPE_CHECKING, Any
+from contextvars import ContextVar
+from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
@@ -19,13 +20,20 @@ from weavecode.core.bus.envelope import (
     JsonRpcSuccess,
     make_error,
 )
-
-if TYPE_CHECKING:
-    from weavecode.core.transport.ipc_broadcaster import IpcEventBroadcaster
+from weavecode.core.transport.ipc_broadcaster import IpcEventBroadcaster
 
 logger = logging.getLogger(__name__)
 
 type CommandHandler = Callable[[dict[str, Any]], Awaitable[Any]]
+
+# 每个连接处理协程中，当前正在处理的 writer（供 handler 读取连接上下文）
+_writer_var: ContextVar[asyncio.StreamWriter] = ContextVar("_writer_var")
+
+
+# 返回当前 handler 调用所属连接的 StreamWriter
+def get_connection_writer() -> asyncio.StreamWriter:
+    return _writer_var.get()
+
 
 _MAX_LINE_BYTES = 1024 * 1024  # 单行帧上限 1 MB，防止异常客户端把内存顶爆
 
@@ -64,7 +72,7 @@ class SocketServer:
         self._server.close()
         await self._server.wait_closed()
 
-    # 处理单个客户端连接，完成后关闭写流
+    # 处理单个客户端连接，完成后清理订阅并关闭写流
     async def _handle_connection(
         self,
         reader: asyncio.StreamReader,
@@ -114,6 +122,7 @@ class SocketServer:
             )
             return
 
+        _writer_var.set(writer)
         try:
             result = await handler(req.params)
         except HandlerError as e:
