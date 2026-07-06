@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
 from weavecode.core.bus.events import StepFinishedEvent, StepStartedEvent
 from weavecode.core.context import ExecutionContext
@@ -10,6 +11,9 @@ from weavecode.core.events.bus import EventBus
 from weavecode.core.llm.base import LLMProvider
 from weavecode.core.tools.invocation import invoke_tool
 from weavecode.core.tools.registry import ToolRegistry
+
+if TYPE_CHECKING:
+    from weavecode.core.task import TaskManager
 
 log = logging.getLogger(__name__)
 
@@ -32,11 +36,30 @@ def _now() -> str:
 
 
 class AgentLoop:
-    # 初始化循环所需依赖：LLM provider、工具注册表与事件总线
-    def __init__(self, provider: LLMProvider, registry: ToolRegistry, bus: EventBus) -> None:
+    # 初始化循环所需依赖：LLM provider、工具注册表、事件总线与任务管理器
+    def __init__(
+        self,
+        provider: LLMProvider,
+        registry: ToolRegistry,
+        bus: EventBus,
+        *,
+        tasks: TaskManager | None = None,
+    ) -> None:
         self._provider = provider
         self._registry = registry
         self._bus = bus
+        # 任务状态由 runner 注入，循环每一步读一次并带给模型与工具链
+        self._tasks = tasks
+
+    # 把当前任务状态拼进 system prompt：模型每一步都能看到清单走到哪了
+    def _task_section(self, system: str) -> str:
+        if self._tasks is None:
+            return system
+        tasks = self._tasks.list()
+        if not tasks:
+            return system
+        lines = [f"- [{task.status}] {task.subject}" for task in tasks]
+        return system + "\n\n## Tasks\n" + "\n".join(lines)
 
     # 驱动 think → tool → observe 闭环，直到模型收工或步数用尽
     async def run(self, context: ExecutionContext) -> None:
@@ -55,7 +78,7 @@ class AgentLoop:
                     bus=self._bus,
                     run_id=context.run_id,
                     step=context.step,
-                    system=context.system_prompt(_SYSTEM_PROMPT),
+                    system=self._task_section(context.system_prompt(_SYSTEM_PROMPT)),
                 )
             except asyncio.CancelledError:
                 # 必须向上传播，让上层有机会在文件关闭后收尾

@@ -15,7 +15,17 @@ from weavecode.core.llm.base import LLMProvider
 from weavecode.core.llm.provider import AnthropicProvider
 from weavecode.core.loop import AgentLoop
 from weavecode.core.runs import RUNS_DIR, new_run_id
-from weavecode.core.tools.builtin import ReadFileTool
+from weavecode.core.task import TaskManager
+from weavecode.core.tools.builtin import (
+    BashTool,
+    ListDirTool,
+    ReadFileTool,
+    TaskCreateTool,
+    TaskGetTool,
+    TaskListTool,
+    TaskUpdateTool,
+    WriteFileTool,
+)
 from weavecode.core.tools.registry import ToolRegistry
 
 log = logging.getLogger(__name__)
@@ -49,8 +59,12 @@ class AgentRunner:
         self._extra_handlers: list[EventHandler] = extra_handlers or []
         self._runs_dir = runs_dir if runs_dir is not None else RUNS_DIR
 
-    # 执行一次完整的 agent run，返回带结果的运行结局
+    # 执行一次 agent run（委托给 run_and_capture）
     async def run(self, goal: str, *, run_id: str | None = None) -> RunOutcome:
+        return await self.run_and_capture(goal, run_id=run_id)
+
+    # 执行 agent run 并返回 RunOutcome（含最终文字结果）
+    async def run_and_capture(self, goal: str, *, run_id: str | None = None) -> RunOutcome:
         run_id = run_id or new_run_id()
         run_path = self._runs_dir / run_id
         run_path.mkdir(parents=True, exist_ok=True)
@@ -67,6 +81,9 @@ class AgentRunner:
             max_steps=self._config.agent.max_steps,
         )
 
+        # 本次运行的任务存储：放在 run 目录下，同一次 run 内的工具共享同一份状态
+        task_manager = TaskManager(run_path / ".tasks")
+
         # 事件文件用 async with 打开：无论正常结束、报错还是被中断都会正确关闭
         async with EventWriter(run_path / "events.jsonl") as writer:
             writer.subscribe(bus)
@@ -77,9 +94,8 @@ class AgentRunner:
                 provider: LLMProvider = self._provider or AnthropicProvider(
                     self._config.llm.default_model
                 )
-                registry = ToolRegistry()
-                registry.register(ReadFileTool())
-                loop = AgentLoop(provider, registry, bus)
+                registry = self._build_registry(task_manager)
+                loop = AgentLoop(provider, registry, bus, tasks=task_manager)
                 await loop.run(context)
             except asyncio.CancelledError:
                 cancelled = True
@@ -110,3 +126,17 @@ class AgentRunner:
             result=context.result,
             reason=context.reason,
         )
+
+    # 构建本次运行的工具注册表：内置文件工具 + 任务工具（共用同一个任务存储）
+    def _build_registry(self, task_manager: TaskManager) -> ToolRegistry:
+        registry = ToolRegistry()
+        for t in [ReadFileTool(), BashTool(), WriteFileTool(), ListDirTool()]:
+            registry.register(t)
+        for t in [
+            TaskCreateTool(task_manager),
+            TaskUpdateTool(task_manager),
+            TaskListTool(task_manager),
+            TaskGetTool(task_manager),
+        ]:
+            registry.register(t)
+        return registry
