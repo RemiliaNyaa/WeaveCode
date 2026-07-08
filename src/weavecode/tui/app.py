@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import Any
 
@@ -18,6 +19,10 @@ from weavecode.core.transport.socket_client import IpcError, SocketClient
 
 def _preview(s: str, n: int) -> str:
     return s[:n] + "…" if len(s) > n else s
+
+
+def _params_str(params: dict[str, Any]) -> str:
+    return json.dumps(params, ensure_ascii=False, indent=2)
 
 
 # 从工具参数中提取最适合摘要展示的关键字段
@@ -62,6 +67,68 @@ class LLMStreamBlock(Static):
             self.update(Markdown(self._text, code_theme="monokai"))
 
 
+class ToolCallBlock(Widget):
+    """可折叠的工具调用块：折叠时显示摘要，点击后展开完整 params 和 output。"""
+
+    DEFAULT_CSS = """
+    ToolCallBlock { height: auto; padding: 0 2; color: $text-muted; }
+    ToolCallBlock > .detail { display: none; padding: 0 2 0 4; color: $text-muted; }
+    ToolCallBlock.expanded > .detail { display: block; }
+    """
+
+    # 初始化工具调用信息
+    def __init__(self, tool_name: str, params: dict[str, Any]) -> None:
+        super().__init__()
+        self._tool_name = tool_name
+        self._params = params
+        self._params_full = _params_str(params)
+        self._output = ""
+        self._elapsed_ms = 0
+        self._is_error = False
+        self._finished = False
+
+    def compose(self) -> ComposeResult:
+        yield Static(self._summary(), classes="summary")
+        yield Static("", classes="detail")
+
+    # 生成折叠状态下的一行摘要
+    def _summary(self) -> str:
+        params_pre = _param_summary(self._tool_name, self._params)
+        line = f"  [dim]tool[/dim] [bold]{self._tool_name}[/bold]"
+        if params_pre:
+            line += f"  [dim]{params_pre}[/dim]"
+        if self._finished:
+            color = "red" if self._is_error else "green"
+            status = "failed" if self._is_error else "done"
+            hint = "  [dim](click to expand)[/dim]" if self._output else ""
+            line += f"  [{color}]{status}[/{color}]  [dim]{self._elapsed_ms}ms[/dim]{hint}"
+        return line
+
+    # 调用结束时写入结果并刷新摘要行
+    def set_result(self, output: str, elapsed_ms: int, *, is_error: bool = False) -> None:
+        self._output = output
+        self._elapsed_ms = elapsed_ms
+        self._is_error = is_error
+        self._finished = True
+        if self.children:
+            self.query_one(".summary", Static).update(self._summary())
+
+    # 点击时在折叠与展开之间切换
+    def on_click(self) -> None:
+        if not self._finished:
+            return
+        if "expanded" in self.classes:
+            self.remove_class("expanded")
+        else:
+            detail = self.query_one(".detail", Static)
+            detail.update(
+                f"[dim]params[/dim]\n{self._params_full}\n\n"
+                f"[dim]output[/dim]\n{self._output}\n\n"
+                f"[dim]elapsed:[/dim] {self._elapsed_ms}ms"
+            )
+            self.add_class("expanded")
+
+
 class WeaveTuiApp(App[None]):
     """WeaveCode TUI：终端滚屏风格，实时展示 agent 执行过程。"""
 
@@ -95,6 +162,7 @@ class WeaveTuiApp(App[None]):
         self._port = port
         self._replay_run_id = replay_run_id
         self._current_llm: LLMStreamBlock | None = None
+        self._pending_tool_blocks: dict[str, ToolCallBlock] = {}
 
     def compose(self) -> ComposeResult:
         yield Label("● connecting...", id="header")
@@ -210,33 +278,28 @@ class WeaveTuiApp(App[None]):
             ))
 
         elif t == "tool.call_started":
+            tool_use_id = str(event.get("tool_use_id", ""))
             tool_name = str(event.get("tool_name", ""))
             params = event.get("params") or {}
-            summary = _param_summary(tool_name, params)
-            summary_part = f"  [dim]{summary}[/dim]" if summary else ""
-            self._append(Static(
-                f"[dim]tool[/dim] [bold]{tool_name}[/bold]{summary_part}",
-                classes="log-line",
-            ))
+            tc_block = ToolCallBlock(tool_name, params)
+            self._pending_tool_blocks[tool_use_id] = tc_block
+            self._append(tc_block)
 
         elif t == "tool.call_finished":
-            tool_name = str(event.get("tool_name", ""))
+            tool_use_id = str(event.get("tool_use_id", ""))
             elapsed_ms = int(event.get("elapsed_ms") or 0)
-            self._append(Static(
-                f"[green]tool ✓[/green] [bold]{tool_name}[/bold]"
-                f"  [dim]{elapsed_ms}ms[/dim]",
-                classes="log-line",
-            ))
+            output = str(event.get("output") or "")
+            if tool_use_id in self._pending_tool_blocks:
+                tc_done = self._pending_tool_blocks.pop(tool_use_id)
+                tc_done.set_result(output, elapsed_ms)
 
         elif t == "tool.call_failed":
-            tool_name = str(event.get("tool_name", ""))
+            tool_use_id = str(event.get("tool_use_id", ""))
             elapsed_ms = int(event.get("elapsed_ms") or 0)
-            error = str(event.get("error_message") or "")
-            self._append(Static(
-                f"[red]tool ✗[/red] [bold]{tool_name}[/bold]"
-                f"  [dim]{_preview(error, 72)}[/dim]  [dim]{elapsed_ms}ms[/dim]",
-                classes="log-line",
-            ))
+            error_msg = str(event.get("error_message") or "")
+            if tool_use_id in self._pending_tool_blocks:
+                tc_done = self._pending_tool_blocks.pop(tool_use_id)
+                tc_done.set_result(error_msg, elapsed_ms, is_error=True)
 
         elif t == "llm.usage":
             self._append(Static(

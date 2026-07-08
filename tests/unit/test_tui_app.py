@@ -5,6 +5,7 @@ from textual.widget import Widget
 
 from weavecode.tui.app import (
     LLMStreamBlock,
+    ToolCallBlock,
     WeaveTuiApp,
     _param_summary,
     _preview,
@@ -100,3 +101,48 @@ def test_run_started_appends_widget_with_content() -> None:
 
 # 功能：验证 run.finished success 追加包含 "completed" 的 widget
 # 设计：monkey-patch _append，检查 rendered 内容包含 completed 和 green
+
+# 功能：验证 tool.call_started 追加 ToolCallBlock，call_finished 更新其结果
+# 设计：直接调用 _handle_event 两次，通过 _pending_tool_blocks 验证状态流转
+def test_tool_call_started_and_finished() -> None:
+    app = WeaveTuiApp("127.0.0.1", 9999)
+    appended: list[Widget] = []
+    app._append = lambda w: appended.append(w)  # type: ignore[method-assign]
+
+    app._handle_event({
+        "type": "tool.call_started",
+        "tool_use_id": "uid-1",
+        "tool_name": "bash",
+        "params": {"command": "echo hi"},
+        "run_id": "r", "ts": "t",
+    })
+    assert "uid-1" in app._pending_tool_blocks  # type: ignore[attr-defined]
+
+    app._handle_event({
+        "type": "tool.call_finished",
+        "tool_use_id": "uid-1",
+        "tool_name": "bash",
+        "elapsed_ms": 42,
+        "output": "hi",
+        "run_id": "r", "ts": "t",
+    })
+    assert "uid-1" not in app._pending_tool_blocks  # type: ignore[attr-defined]
+    block = appended[0]
+    assert isinstance(block, ToolCallBlock)
+    assert block._finished  # type: ignore[attr-defined]
+    assert block._output == "hi"  # type: ignore[attr-defined]
+
+
+# 功能：验证提交用户输入时会追加 user turn，并进入 busy 状态
+# 设计：用 fake client 替代 SocketClient，直接调用 on_chat_text_area_submitted，
+#       覆盖 TextArea 清空内容 + 设置 busy 占位符的核心状态迁移
+
+# 功能：验证未知事件类型不抛异常也不追加任何 widget
+# 设计：发送 type 为 unknown 的事件，断言 appended 为空
+def test_unknown_event_silently_ignored() -> None:
+    app = WeaveTuiApp("127.0.0.1", 9999)
+    appended: list[Widget] = []
+    app._append = lambda w: appended.append(w)  # type: ignore[method-assign]
+
+    app._handle_event({"type": "some.unknown.type", "run_id": "r", "ts": "t"})
+    assert appended == []
