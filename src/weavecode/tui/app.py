@@ -129,6 +129,46 @@ class ToolCallBlock(Widget):
             self.add_class("expanded")
 
 
+class TaskListBlock(Static):
+    """日志流里的任务列表：任务创建与状态变化都在这一块里就地更新。"""
+
+    DEFAULT_CSS = "TaskListBlock { height: auto; padding: 0 2; color: $text-muted; }"
+
+    _MARKS: dict[str, str] = {
+        "pending": "[dim]○[/dim]",
+        "in_progress": "[yellow]◐[/yellow]",
+        "completed": "[green]●[/green]",
+        "cancelled": "[dim]⊗[/dim]",
+    }
+
+    # 初始化空任务列表
+    def __init__(self) -> None:
+        super().__init__("")
+        self._tasks: list[dict[str, str]] = []
+
+    # 追加一个新任务，状态从 pending 开始
+    def add_task(self, subject: str) -> None:
+        self._tasks.append({"subject": subject, "status": "pending"})
+        self._redraw()
+
+    # 按任务编号更新状态，编号从 1 开始
+    def set_status(self, task_id: int, status: str) -> None:
+        index = task_id - 1
+        if 0 <= index < len(self._tasks):
+            self._tasks[index]["status"] = status
+            self._redraw()
+
+    # 重新排版整个任务列表
+    def _redraw(self) -> None:
+        if not self._tasks:
+            return
+        lines = ["[bold cyan]tasks[/bold cyan]"]
+        for i, task in enumerate(self._tasks, start=1):
+            mark = self._MARKS.get(task["status"], "[dim]?[/dim]")
+            lines.append(f"  {i}. {mark} {task['subject']}")
+        self.update("\n".join(lines))
+
+
 class WeaveTuiApp(App[None]):
     """WeaveCode TUI：终端滚屏风格，实时展示 agent 执行过程。"""
 
@@ -163,9 +203,10 @@ class WeaveTuiApp(App[None]):
         self._replay_run_id = replay_run_id
         self._current_llm: LLMStreamBlock | None = None
         self._pending_tool_blocks: dict[str, ToolCallBlock] = {}
+        self._task_list: TaskListBlock | None = None
 
     def compose(self) -> ComposeResult:
-        yield Label("● connecting...", id="header")
+        yield Label("[bold]WeaveCode[/bold]  [dim]connecting...[/dim]", id="header")
         yield VerticalScroll(id="log-view")
 
     # 挂载后启动连接守护进程的 worker
@@ -184,20 +225,54 @@ class WeaveTuiApp(App[None]):
             self._current_llm.finalize_markdown()
             self._current_llm = None
 
+    # 根据连接与运行状态刷新顶部状态栏
+    def _update_header(self, state: str) -> None:
+        try:
+            header = self.query_one("#header", Label)
+        except Exception:
+            return
+        color = {
+            "ready": "green",
+            "running": "yellow",
+            "disconnected": "red",
+            "connecting": "dim",
+        }.get(state, "dim")
+        header.update(
+            f"[bold]WeaveCode[/bold]  [dim]{self._host}:{self._port}[/dim]"
+            f"  [{color}]{state}[/{color}]"
+        )
+
+    # 惰性挂出任务列表，后续任务事件都更新这一块
+    def _tasks(self) -> TaskListBlock:
+        if self._task_list is None:
+            self._task_list = TaskListBlock()
+            self._append(self._task_list)
+        return self._task_list
+
+    # 任务工具的调用落到任务列表上：建任务、改状态就地刷新
+    def _track_task(self, tool_name: str, params: dict[str, Any]) -> None:
+        if tool_name == "task_create":
+            self._tasks().add_task(str(params.get("subject", "")))
+        elif tool_name == "task_update":
+            task_id = int(params.get("id") or 0)
+            status = str(params.get("status") or "")
+            if task_id > 0 and status:
+                self._tasks().set_status(task_id, status)
+
     # 管理 SocketClient 生命周期：连接、订阅事件、断线重连
     async def _socket_loop(self) -> None:
-        header = self.query_one("#header", Label)
-
         while True:
             client = SocketClient(self._host, self._port)
+            self._update_header("connecting")
             try:
                 await client.connect()
             except (ConnectionRefusedError, OSError):
-                header.update("● not connected — retrying in 2s")
+                log.warning("connection refused %s:%s, retrying", self._host, self._port)
+                self._update_header("disconnected")
                 await asyncio.sleep(2)
                 continue
 
-            header.update(f"● connected  {self._host}:{self._port}")
+            log.info("connected to %s:%s", self._host, self._port)
             loop_task = asyncio.create_task(client.run_event_loop())
 
             async def on_event(event: dict[str, Any]) -> None:
@@ -213,16 +288,17 @@ class WeaveTuiApp(App[None]):
                 if self._replay_run_id is not None:
                     params["replay_from_run"] = self._replay_run_id
                 await client.send_command("event.subscribe", params)
+                self._update_header("ready")
                 await loop_task
             except IpcError as e:
-                header.update(f"● subscribe error: {e}")
+                log.error("subscribe error: %s", e)
             finally:
                 self._break_llm()
                 if not loop_task.done():
                     loop_task.cancel()
                 await client.close()
 
-            header.update("● disconnected — retrying in 2s")
+            self._update_header("disconnected")
             await asyncio.sleep(2)
 
     # 根据事件 type 路由到对应渲染逻辑；单个事件渲染失败不会掀翻 socket loop
@@ -250,6 +326,7 @@ class WeaveTuiApp(App[None]):
         if t == "run.started":
             run_id = event.get("run_id", "")
             goal = event.get("goal", "")
+            self._update_header("running")
             self._append(Static(
                 f"[dim]run[/dim]  [cyan]{run_id}[/cyan]  [dim]{_preview(goal, 96)}[/dim]",
                 classes="run-header",
@@ -259,6 +336,7 @@ class WeaveTuiApp(App[None]):
             status = event.get("status", "")
             steps = event.get("steps", 0)
             reason = event.get("reason") or ""
+            self._update_header("ready")
             if status == "success":
                 self._append(Static(
                     f"[bold green]✓ completed[/bold green]  [dim]{steps} steps[/dim]",
@@ -284,6 +362,7 @@ class WeaveTuiApp(App[None]):
             tc_block = ToolCallBlock(tool_name, params)
             self._pending_tool_blocks[tool_use_id] = tc_block
             self._append(tc_block)
+            self._track_task(tool_name, params)
 
         elif t == "tool.call_finished":
             tool_use_id = str(event.get("tool_use_id", ""))
