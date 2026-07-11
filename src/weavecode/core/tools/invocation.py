@@ -4,6 +4,8 @@ import asyncio
 import time
 from datetime import UTC, datetime
 
+from pydantic import ValidationError
+
 from weavecode.core.bus.events import (
     ToolCallFailedEvent,
     ToolCallFinishedEvent,
@@ -41,10 +43,10 @@ async def _fail(
             ts=_now(),
         )
     )
-    return ToolResult(content=error_message, is_error=True)
+    return ToolResult(content=error_message, is_error=True, error_type=error_class)
 
 
-# 按名取工具、限时调用、发布进度事件，失败时转成 ToolResult 回填（不抛异常）
+# 校验参数、限时调用工具、发布进度事件，失败时转成 ToolResult 回填（不抛异常）
 async def invoke_tool(
     registry: ToolRegistry,
     tool_call: ToolCallBlock,
@@ -74,10 +76,24 @@ async def invoke_tool(
             "runtime_error", f"unknown tool: {tool_call.name}", elapsed(),
         )
 
+    if tool.params_model is not None:
+        try:
+            tool.params_model.model_validate(dict(tool_call.input))
+        except ValidationError as exc:
+            return await _fail(
+                bus, run_id, tool_call,
+                "schema_error", str(exc), elapsed(),
+            )
+
     try:
         result = await asyncio.wait_for(
             tool.invoke(dict(tool_call.input)), timeout=timeout
         )
+        ms = elapsed()
+
+        if result.is_error:
+            error_class = result.error_type or "runtime_error"
+            return await _fail(bus, run_id, tool_call, error_class, result.content, ms)
     except TimeoutError:
         return await _fail(
             bus, run_id, tool_call,
@@ -86,15 +102,12 @@ async def invoke_tool(
     except Exception as exc:
         return await _fail(bus, run_id, tool_call, "runtime_error", str(exc), elapsed())
 
-    if result.is_error:
-        return await _fail(bus, run_id, tool_call, "runtime_error", result.content, elapsed())
-
     await bus.publish(
         ToolCallFinishedEvent(
             run_id=run_id,
             tool_use_id=tool_call.id,
             tool_name=tool_call.name,
-            elapsed_ms=elapsed(),
+            elapsed_ms=ms,
             output=result.content,
             ts=_now(),
         )

@@ -2,13 +2,22 @@ from __future__ import annotations
 
 import asyncio
 
+from pydantic import BaseModel, ConfigDict, Field
+
 from weavecode.core.tools.base import BaseTool, ToolResult
 
 _MAX_OUTPUT_BYTES = 64 * 1024  # 64 KB
 _DEFAULT_TIMEOUT = 60
 
 
+class BashParams(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    command: str
+    timeout: int = Field(default=_DEFAULT_TIMEOUT, ge=1, le=120)
+
+
 class BashTool(BaseTool):
+    params_model = BashParams
     name = "bash"
     description = (
         "Execute a shell command and return its output (stdout + stderr combined).\n"
@@ -30,13 +39,11 @@ class BashTool(BaseTool):
         "required": ["command"],
     }
 
-    # 在子进程中执行 shell 命令，合并 stdout/stderr，超时中断并把输出截断到 64 KB
+    # 在子进程中执行 shell 命令，合并 stdout/stderr，超时或非零退出码时返回错误
     async def invoke(self, params: dict[str, object]) -> ToolResult:
-        command = str(params.get("command", ""))
-        if not command:
-            return ToolResult(content="command is required", is_error=True)
-        timeout = int(params.get("timeout", _DEFAULT_TIMEOUT))
-        timeout = max(1, min(120, timeout))
+        p = BashParams.model_validate(params)
+        command = p.command
+        timeout = p.timeout
 
         proc = await asyncio.create_subprocess_shell(
             command,
@@ -48,7 +55,11 @@ class BashTool(BaseTool):
         except TimeoutError:
             proc.kill()
             await proc.communicate()
-            return ToolResult(content=f"[timeout after {timeout}s]", is_error=True)
+            return ToolResult(
+                content=f"[timeout after {timeout}s]",
+                is_error=True,
+                error_type="timeout",
+            )
 
         output = stdout_bytes.decode("utf-8")
         if len(stdout_bytes) > _MAX_OUTPUT_BYTES:
@@ -56,5 +67,9 @@ class BashTool(BaseTool):
 
         returncode = proc.returncode or 0
         if returncode != 0:
-            return ToolResult(content=f"[exit {returncode}]\n{output}", is_error=True)
+            return ToolResult(
+                content=f"[exit {returncode}]\n{output}",
+                is_error=True,
+                error_type="runtime_error",
+            )
         return ToolResult(content=output or "[no output]")

@@ -1,12 +1,22 @@
 from __future__ import annotations
 
+from pydantic import BaseModel, ConfigDict, Field
+
 from weavecode.core.task.manager import TaskManager
 from weavecode.core.tools.base import BaseTool, ToolResult
+
+
+class TaskCreateParams(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    subject: str
+    description: str = ""
+    blocked_by: list[int] = Field(default_factory=list)
 
 
 class TaskCreateTool(BaseTool):
     """创建任务：写入 task_{id}.json 并自增编号。"""
 
+    params_model = TaskCreateParams
     name = "task_create"
     description = (
         "Create a task in the shared task list.\n"
@@ -38,24 +48,16 @@ class TaskCreateTool(BaseTool):
         self._manager = manager
 
     async def invoke(self, params: dict[str, object]) -> ToolResult:
-        subject = str(params.get("subject", "")).strip()
+        p = TaskCreateParams.model_validate(params)
+        subject = p.subject.strip()
         if not subject:
-            return ToolResult(content="subject is required", is_error=True)
-
-        description = str(params.get("description", ""))
-        raw = params.get("blocked_by") or []
-        if not isinstance(raw, list):
             return ToolResult(
-                content="blocked_by must be a list of task ids", is_error=True
-            )
-        try:
-            blocked_by = [int(x) for x in raw]
-        except (TypeError, ValueError):
-            return ToolResult(
-                content="blocked_by must contain integer task ids", is_error=True
+                content="subject is required",
+                is_error=True,
+                error_type="runtime_error",
             )
 
-        task = self._manager.create(subject, description, blocked_by)
+        task = self._manager.create(subject, p.description, list(p.blocked_by))
         msg = f"Created task #{task.id}: {task.subject}"
         if task.blocked_by:
             msg += f" (blocked by: {task.blocked_by})"

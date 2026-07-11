@@ -2,12 +2,20 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from pydantic import BaseModel, ConfigDict
+
 from weavecode.core.tools.base import BaseTool, ToolResult
 
 _MAX_BYTES = 512 * 1024  # 512 KB
 
 
+class ReadFileParams(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    path: str
+
+
 class ReadFileTool(BaseTool):
+    params_model = ReadFileParams
     name = "read_file"
     description = (
         "Read the content of a file.\n"
@@ -24,15 +32,14 @@ class ReadFileTool(BaseTool):
         "required": ["path"],
     }
 
-    # 读整个文件返回纯文本，超过 512 KB 截断
+    # 读整个文件返回纯文本，超过 512 KB 截断；参数由 ReadFileParams 统一校验
     async def invoke(self, params: dict[str, object]) -> ToolResult:
-        path_str = str(params.get("path", ""))
-        if not path_str:
-            return ToolResult(content="path is required", is_error=True)
-        if ".." in Path(path_str).parts:
-            raise PermissionError(f"path traversal not allowed: {path_str}")
+        p = ReadFileParams.model_validate(params)
+        path = Path(p.path)
+        if ".." in path.parts:
+            raise PermissionError(f"path traversal not allowed: {p.path}")
 
-        data = Path(path_str).read_bytes()
+        data = path.read_bytes()
         if len(data) > _MAX_BYTES:
             data = data[:_MAX_BYTES]
             return ToolResult(

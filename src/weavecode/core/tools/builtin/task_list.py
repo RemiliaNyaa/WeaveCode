@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pydantic import BaseModel, ConfigDict
+
 from weavecode.core.task.manager import TaskManager
 from weavecode.core.task.model import TASK_STATUSES, Task
 from weavecode.core.tools.base import BaseTool, ToolResult
@@ -13,9 +15,15 @@ _MARKS = {
 }
 
 
+class TaskListParams(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    status: str = ""
+
+
 class TaskListTool(BaseTool):
     """列出全部任务及状态，按 id 排序，可按状态过滤。"""
 
+    params_model = TaskListParams
     name = "task_list"
     description = (
         "List every task with its status, sorted by id.\n"
@@ -37,8 +45,8 @@ class TaskListTool(BaseTool):
         self._manager = manager
 
     async def invoke(self, params: dict[str, object]) -> ToolResult:
-        raw = params.get("status")
-        status = None if raw in (None, "") else str(raw)
+        p = TaskListParams.model_validate(params)
+        status = p.status or None
         if status is not None and status not in TASK_STATUSES:
             return ToolResult(
                 content=(
@@ -46,6 +54,7 @@ class TaskListTool(BaseTool):
                     f"(expected one of {', '.join(TASK_STATUSES)})"
                 ),
                 is_error=True,
+                error_type="runtime_error",
             )
 
         tasks = self._manager.list(status)
