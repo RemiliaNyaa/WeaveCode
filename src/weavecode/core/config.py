@@ -16,6 +16,7 @@ _DEFAULT_LOG_FORMAT = "text"
 _DEFAULT_CONFIG_PATH = "~/.weave/config.toml"
 _DEFAULT_MAX_STEPS = 20
 _DEFAULT_MODEL = "claude-sonnet-4-6"
+_DEFAULT_TRACE_FILE = "~/.weave/traces/daemon.jsonl"
 
 
 @dataclass
@@ -37,12 +38,20 @@ class LlmConfig:
 
 
 @dataclass
+class TraceConfig:
+    enabled: bool = True
+    file: str = _DEFAULT_TRACE_FILE
+    include_llm_payload: bool = True  # false 时 LLM 记录只保留摘要
+
+
+@dataclass
 class WeaveConfig:
     host: str = _DEFAULT_HOST
     port: int = _DEFAULT_PORT
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
     llm: LlmConfig = field(default_factory=LlmConfig)
+    trace: TraceConfig = field(default_factory=TraceConfig)
 
 
 # 构建并返回运行时配置：默认值 → TOML → .env → WEAVE_* 环境变量（后者优先级最高）
@@ -166,6 +175,17 @@ def _apply_toml(config: WeaveConfig, data: dict[str, Any]) -> None:
     if router is not None:
         config.llm.router = router
 
+    trace = _section(data, "trace")
+    enabled = _read_bool(trace, "enabled", "trace.enabled")
+    if enabled is not None:
+        config.trace.enabled = enabled
+    trace_file = _read_str(trace, "file", "trace.file")
+    if trace_file is not None:
+        config.trace.file = trace_file
+    payload = _read_bool(trace, "include_llm_payload", "trace.include_llm_payload")
+    if payload is not None:
+        config.trace.include_llm_payload = payload
+
 
 # 用 WEAVE_* 环境变量覆盖 config 中对应字段（若变量已设置）
 def _apply_env(config: WeaveConfig) -> None:
@@ -210,3 +230,15 @@ def _apply_env(config: WeaveConfig) -> None:
     default_model = os.environ.get("WEAVE_LLM_DEFAULT_MODEL")
     if default_model is not None:
         config.llm.default_model = default_model
+
+    trace_enabled = os.environ.get("WEAVE_TRACE_ENABLED")
+    if trace_enabled is not None:
+        config.trace.enabled = trace_enabled.lower() not in ("0", "false", "no")
+
+    trace_file = os.environ.get("WEAVE_TRACE_FILE")
+    if trace_file is not None:
+        config.trace.file = trace_file
+
+    trace_payload = os.environ.get("WEAVE_TRACE_INCLUDE_LLM_PAYLOAD")
+    if trace_payload is not None:
+        config.trace.include_llm_payload = trace_payload.lower() not in ("0", "false", "no")
