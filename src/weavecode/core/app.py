@@ -8,7 +8,11 @@ import logging
 import signal
 import sys
 import time
+from datetime import UTC
+from pathlib import Path
 from typing import Any
+
+from pydantic import BaseModel
 
 import weavecode
 from weavecode.core.bus.commands import (
@@ -24,18 +28,24 @@ from weavecode.core.events.bus import EventBus
 from weavecode.core.logging_setup import setup_logging
 from weavecode.core.runner import AgentRunner
 from weavecode.core.runs import events_file, new_run_id
+from weavecode.core.trace.record import TraceRecord
+from weavecode.core.trace.writer import TraceWriter
 from weavecode.core.transport.ipc_broadcaster import IpcEventBroadcaster
 from weavecode.core.transport.socket_server import SocketServer, get_connection_writer
 
 logger = logging.getLogger(__name__)
 
 
+def _now() -> str:
+    return datetime.datetime.now(UTC).isoformat()
+
+
 class CoreApp:
     def __init__(self) -> None:
         self._start_time = time.monotonic()
         self._bus = EventBus()
-        self._broadcaster = IpcEventBroadcaster()
-        self._bus.subscribe(self._broadcaster.handle)   # broadcaster 挂到总线
+        self._broadcaster: IpcEventBroadcaster | None = None
+        self._trace: TraceWriter | None = None
         self._config: WeaveConfig | None = None
         self._current_run_task: asyncio.Task[None] | None = None
 
@@ -49,6 +59,21 @@ class CoreApp:
             received_at=datetime.datetime.now(datetime.UTC).isoformat(),
         )
 
+    # 将 EventBus 事件写入 trace（作为 EventBus 订阅者）
+    async def _trace_event_handler(self, event: BaseModel) -> None:
+        assert self._trace is not None
+        event_dict = event.model_dump()
+        self._trace.emit(
+            TraceRecord(
+                ts=_now(),
+                direction="CORE",
+                layer="event",
+                kind="event",
+                run_id=event_dict.get("run_id"),
+                data=event_dict,
+            )
+        )
+
     # 启动一次 agent run：异步创建 AgentRunner 并立即返回 run_id
     async def _agent_run_handler(self, params: dict[str, Any]) -> AgentRunResult:
         cmd = AgentRunCommand.model_validate(params)
@@ -57,7 +82,7 @@ class CoreApp:
             raise RuntimeError("a run is already in progress")
 
         run_id = new_run_id()
-        runner = AgentRunner(self._config, bus=self._bus)
+        runner = AgentRunner(self._config, bus=self._bus, trace=self._trace)
         self._current_run_task = asyncio.create_task(
             runner.run(cmd.goal, run_id=run_id)   # 后台运行，不等它完成
         )
@@ -74,6 +99,7 @@ class CoreApp:
                 cmd.replay_from_run, writer, cmd.topics
             )
 
+        assert self._broadcaster is not None
         sub_id = self._broadcaster.subscribe(writer, cmd.topics, cmd.scope)
         return EventSubscribeResult(subscription_id=sub_id, replayed_count=replayed_count)
 
@@ -102,16 +128,26 @@ class CoreApp:
             await writer.drain()
         return count
 
-    # 启动守护进程：加载配置、初始化日志、启动 TCP 服务器，并等待退出信号
+    # 启动守护进程：加载配置、初始化日志、启动 trace、启动 TCP 服务器，并等待退出信号
     async def run(self) -> None:
         self._start_time = time.monotonic()
         self._config = get_config()
         setup_logging(self._config)
 
+        if self._config.trace.enabled:
+            trace_path = Path(self._config.trace.file).expanduser()
+            self._trace = TraceWriter(trace_path)
+            await self._trace.start()
+            self._bus.subscribe(self._trace_event_handler)
+
+        self._broadcaster = IpcEventBroadcaster(trace=self._trace)
+        self._bus.subscribe(self._broadcaster.handle)
+
         server = SocketServer(
             self._config.host,
             self._config.port,
             self._broadcaster,
+            trace=self._trace,
         )
         server.register("core.ping", self._ping_handler)
         server.register("agent.run", self._agent_run_handler)
@@ -138,6 +174,8 @@ class CoreApp:
             self._current_run_task.cancel()
             await asyncio.gather(self._current_run_task, return_exceptions=True)
         await server.stop()
+        if self._trace is not None:
+            await self._trace.stop()
 
 
 # 同步入口：启动 CoreApp 事件循环

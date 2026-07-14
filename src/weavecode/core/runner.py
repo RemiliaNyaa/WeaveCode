@@ -16,6 +16,8 @@ from weavecode.core.llm.provider import AnthropicProvider
 from weavecode.core.loop import AgentLoop
 from weavecode.core.runs import RUNS_DIR, new_run_id
 from weavecode.core.task import TaskManager
+from weavecode.core.trace.provider import TracingProvider
+from weavecode.core.trace.writer import TraceWriter
 from weavecode.core.tools.builtin import (
     BashTool,
     ListDirTool,
@@ -51,12 +53,14 @@ class AgentRunner:
         bus: EventBus | None = None,
         provider: LLMProvider | None = None,
         extra_handlers: list[EventHandler] | None = None,
+        trace: TraceWriter | None = None,
         runs_dir: Path | None = None,
     ) -> None:
         self._config = config
         self._bus = bus
         self._provider = provider
         self._extra_handlers: list[EventHandler] = extra_handlers or []
+        self._trace = trace
         self._runs_dir = runs_dir if runs_dir is not None else RUNS_DIR
 
     # 执行一次 agent run（委托给 run_and_capture）
@@ -94,6 +98,13 @@ class AgentRunner:
                 provider: LLMProvider = self._provider or AnthropicProvider(
                     self._config.llm.default_model
                 )
+                # 有 trace 时在外层包一层：LLM 的请求与响应往返都写进 trace 文件
+                if self._trace is not None:
+                    provider = TracingProvider(
+                        provider,
+                        self._trace,
+                        include_payload=self._config.trace.include_llm_payload,
+                    )
                 registry = self._build_registry(task_manager)
                 loop = AgentLoop(provider, registry, bus, tasks=task_manager)
                 await loop.run(context)
