@@ -47,7 +47,81 @@ pong server=0.0.1 uptime=150ms latency=2ms
 
 `server` 是守护进程的版本号，`uptime` 是它已运行的时长，`latency` 是本次请求的往返耗时。守护进程用 `Ctrl+C` 停止。
 
+## 运行指令
+
+| 指令 | 作用 | 前置条件 |
+|------|------|----------|
+| `weave-core` | 启动守护进程（Agent 的执行核心） | 已配置 `.env`（需 API Key） |
+| `weave ping` | 验证守护进程是否连通 | 守护进程已启动 |
+| `weave run --goal "..."` | 非交互式执行一次任务 | 守护进程已启动 |
+| `weave-tui` | 交互式终端界面（实时看执行过程） | 守护进程已启动 |
+| `weave --version` | 查看版本号 | — |
+
+### `weave-core` —— 启动守护进程
+
+真正执行 Agent 任务的是守护进程，CLI 与 TUI 都只是连接它的客户端。启动时读取配置、初始化日志、监听 TCP 端口，然后等待客户端连接。
+
+```bash
+uv run weave-core
+```
+
+```text
+level=INFO ts=2026-07-16T21:02:11 source=weavecode.core.app msg="weave-core 0.0.1 listening addr=127.0.0.1:7437"
+```
+
+看到 `listening addr=...` 就表示就绪。按 `Ctrl+C` 优雅退出。
+
+### `weave ping` —— 探活
+
+向守护进程发一个 JSON-RPC `ping`，验证链路是否通畅：
+
+```bash
+uv run weave ping
+```
+
+```text
+pong server=0.0.1 uptime=27530ms latency=0ms
+```
+
+连不上时会给出明确提示并以退出码 1 结束：
+
+```text
+error: core not running (127.0.0.1:7437)
+```
+
+### `weave run --goal "..."` —— 按目标执行任务
+
+把目标交给守护进程，Agent 自主规划、调用工具、给出结果；执行进度逐行打印到终端，适合脚本化验证链路：
+
+```bash
+uv run weave run --goal "读取当前目录下 README.md 的内容，然后简要总结这个项目是做什么的。"
+```
+
+```text
+[run] 20260716-131500-3f9c2a
+[step 1] planning...
+[tool] read_file {"path": "README.md"}
+[tool] read_file ✓  0ms
+[step 1] done
+[step 2] planning...
+我已经读取了 README.md 的内容，下面是对这个项目的简要总结：
+...
+[step 2] done
+[run] success  2 steps  6.2s
+```
+
+`[run]` 后面是本次运行的 id，事件文件与 trace 都以它命名；`[step N] planning...` 是 ReAct 循环的一步；`[tool]` 是模型发起的工具调用与结果；最后一行给出成功与否、步数与耗时。任务失败时进程以非零码退出。
+
+### `weave-tui` —— 交互式终端界面
+
+连接守护进程后提供可视化界面：实时看到模型流式输出、工具调用过程与事件流。这是日常使用的主前端，`weave run` 只是脚本化的简化客户端。
+
+```bash
+uv run weave-tui
+```
+
 ## 环境要求
 
 - Python 3.12（与 `pyproject.toml` 的依赖范围、静态检查口径一致）
 - 仅监听 `127.0.0.1`，不对外网开放
+- `weave run` / `weave-tui` 需要在 `.env` 里配置模型 API Key（复制 `.env.example` 为 `.env` 后按需修改）
