@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-SessionStatus = Literal["active", "closed"]
+SessionStatus = Literal["active", "waiting_for_input", "closed"]
 SessionMode = Literal["one_shot", "chat"]
 
 

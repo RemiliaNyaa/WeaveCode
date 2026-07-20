@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from weavecode.core.bus.events import StepFinishedEvent, StepStartedEvent
 from weavecode.core.context import ExecutionContext
@@ -44,12 +44,17 @@ class AgentLoop:
         bus: EventBus,
         *,
         tasks: TaskManager | None = None,
+        session_id: str = "",
+        permission_manager: Any = None,
     ) -> None:
         self._provider = provider
         self._registry = registry
         self._bus = bus
         # 任务状态由 runner 注入，循环每一步读一次并带给模型与工具链
         self._tasks = tasks
+        # 会话标识与权限管理器由 runner 注入，工具调用前先过审批
+        self._session_id = session_id
+        self._permission_manager = permission_manager
 
     # 把当前任务状态拼进 system prompt：模型每一步都能看到清单走到哪了
     def _task_section(self, system: str) -> str:
@@ -101,8 +106,17 @@ class AgentLoop:
 
             # act：逐个执行工具调用，失败结果同样回填给模型
             if response.stop_reason == "tool_use":
+                # 会话标识随权限审批一起下发（审批按会话记缓存）；没接入审批链路时保持最简调用
+                invoke_extra: dict[str, Any] = {}
+                if self._permission_manager is not None:
+                    invoke_extra = {
+                        "permission_manager": self._permission_manager,
+                        "session_id": self._session_id,
+                    }
                 for tc in response.tool_calls:
-                    result = await invoke_tool(self._registry, tc, self._bus, context.run_id)
+                    result = await invoke_tool(
+                        self._registry, tc, self._bus, context.run_id, **invoke_extra
+                    )
                     context.add_tool_result(tc.id, result.content, is_error=result.is_error)
 
             # 终止检查：模型收工优先于步数上限

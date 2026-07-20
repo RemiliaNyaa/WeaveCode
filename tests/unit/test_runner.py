@@ -126,6 +126,16 @@ async def test_config_max_steps_passed_to_loop(tmp_path: Path) -> None:
     assert provider._call == 3
 
 
+
+# 功能：验证 run.started 和 run.finished 事件使用相同且非空的 run_id
+# 设计：同时检查两个事件的 run_id 字段，确认 runner 在整个 run 生命周期使用同一个 run_id
+async def test_run_id_embedded_in_started_event(tmp_path: Path) -> None:
+    events = await _run(tmp_path=tmp_path)
+    started = next(e for e in events if e.type == "run.started")  # type: ignore[attr-defined]
+    finished = next(e for e in events if e.type == "run.finished")  # type: ignore[attr-defined]
+    assert started.run_id == finished.run_id  # type: ignore[attr-defined]
+    assert len(started.run_id) > 0  # type: ignore[attr-defined]
+
 # 功能：验证注入外部 EventBus 时，runner 使用该 bus 而不自建，外部订阅者能收到所有事件
 # 设计：显式传入 EventBus 实例并订阅收集器，确认 runner 不再内部新建 bus（否则外部订阅者收不到事件）；
 #       这是 CoreApp 注入全局 bus 的核心行为，单元测试级别验证可避免集成测试的守护进程依赖
