@@ -36,11 +36,13 @@ class ExecutionContext:
         elif not self.messages:
             self.messages.append({"role": "user", "content": self.goal})
 
-    # 返回本次运行的 system prompt：基础段 + 工具使用说明
+    # 返回本次运行的 system prompt：基础段 + 工具使用说明 + 会话笔记
     # 静态文本排在前面、动态内容排在后面，稳定的前缀才能吃到 prompt caching
     def system_prompt(self, base: str) -> str:
         parts = [base]
         parts.append("\n\n" + _TOOL_USAGE)
+        if self.session_notes.strip():
+            parts.append("\n\n## Session Notes\n" + self.session_notes.strip())
         return "".join(parts)
 
     # 将 LLM 响应的 content blocks 追加为 assistant 消息
