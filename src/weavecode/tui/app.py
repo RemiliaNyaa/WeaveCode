@@ -8,13 +8,18 @@ from typing import Any
 log = logging.getLogger(__name__)
 
 from rich.markdown import Markdown
+from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import VerticalScroll
+from textual.message import Message
 from textual.widget import Widget
-from textual.widgets import Label, Static
+from textual.widgets import Label, Static, TextArea
 
 from weavecode.core.transport.socket_client import IpcError, SocketClient
+
+# 输入框解锁后的边框标题
+_PROMPT_HINT = "type a message — enter to send, ⌘/⇧/⌥+enter for newline"
 
 
 def _preview(s: str, n: int) -> str:
@@ -32,6 +37,7 @@ def _param_summary(tool_name: str, params: dict[str, Any], max_len: int = 72) ->
         "write_file": ("path",),
         "list_dir": ("path", "max_depth"),
         "bash": ("command",),
+        "note_save": ("title",),
     }
     keys = keys_by_tool.get(tool_name, ())
     parts = [f"{key}={params[key]!r}" for key in keys if key in params]
@@ -100,6 +106,9 @@ class ToolCallBlock(Widget):
         if self._finished:
             color = "red" if self._is_error else "green"
             status = "failed" if self._is_error else "done"
+            if self._tool_name == "note_save" and not self._is_error:
+                status = "remembered"
+                color = "green"
             hint = "  [dim](click to expand)[/dim]" if self._output else ""
             line += f"  [{color}]{status}[/{color}]  [dim]{self._elapsed_ms}ms[/dim]{hint}"
         return line
@@ -169,6 +178,51 @@ class TaskListBlock(Static):
         self.update("\n".join(lines))
 
 
+class ChatTextArea(TextArea):
+    """支持 Enter 提交、Cmd/Shift/Alt+Enter 换行的多行聊天输入框。"""
+
+    DEFAULT_CSS = """
+    ChatTextArea {
+        height: auto;
+        min-height: 3;
+        max-height: 12;
+        border: round $surface-lighten-2;
+        background: $background;
+        padding: 0 1;
+        margin: 1 2;
+        scrollbar-size-vertical: 1;
+    }
+    ChatTextArea:focus {
+        border: round $accent;
+        background: $background;
+    }
+    """
+
+    # 子类自定义的提交消息，供宿主 App 监听
+    class Submitted(Message):
+        def __init__(self, area: ChatTextArea) -> None:
+            self.text_area = area
+            self.value = area.text
+            super().__init__()
+
+    # Enter 提交；Cmd/Shift/Alt+Enter 插入换行；其余键交回 TextArea
+    async def _on_key(self, event: events.Key) -> None:
+        key = event.key
+        if key == "enter":
+            event.stop()
+            event.prevent_default()
+            if self.text.strip():
+                self.post_message(self.Submitted(self))
+            return
+        if key in ("alt+enter", "shift+enter", "ctrl+j", "super+enter"):
+            event.stop()
+            event.prevent_default()
+            if not self.read_only:
+                self.insert("\n")
+            return
+        await super()._on_key(event)
+
+
 class WeaveTuiApp(App[None]):
     """WeaveCode TUI：终端滚屏风格，实时展示 agent 执行过程。"""
 
@@ -193,6 +247,7 @@ class WeaveTuiApp(App[None]):
     Static.run-err { color: red; padding: 0 2 1 2; }
     Static.usage { padding: 0 2; }
     Static.log-line { padding: 0 2; }
+    Static.user-turn { color: $text; padding: 1 2 0 2; }
     """
 
     # 初始化连接参数和 TUI 内部状态
@@ -201,6 +256,9 @@ class WeaveTuiApp(App[None]):
         self._host = host
         self._port = port
         self._replay_run_id = replay_run_id
+        self._client: SocketClient | None = None
+        self._session_id: str | None = None
+        self._busy = False
         self._current_llm: LLMStreamBlock | None = None
         self._pending_tool_blocks: dict[str, ToolCallBlock] = {}
         self._task_list: TaskListBlock | None = None
@@ -208,10 +266,21 @@ class WeaveTuiApp(App[None]):
     def compose(self) -> ComposeResult:
         yield Label("[bold]WeaveCode[/bold]  [dim]connecting...[/dim]", id="header")
         yield VerticalScroll(id="log-view")
+        yield ChatTextArea(id="prompt", show_line_numbers=False)
 
-    # 挂载后启动连接守护进程的 worker
+    # 挂载后锁住输入框并启动连接守护进程的 worker
     def on_mount(self) -> None:
         self.run_worker(self._socket_loop(), exclusive=True, name="socket")
+        prompt = self.query_one("#prompt", ChatTextArea)
+        prompt.disabled = True
+        prompt.border_title = "connecting..."
+
+    # 安全获取输入框，组件测试里未挂载时跳过 UI 操作
+    def _prompt(self) -> ChatTextArea | None:
+        try:
+            return self.query_one("#prompt", ChatTextArea)
+        except Exception:
+            return None
 
     # 向单列滚动流里挂一个 widget 并滚到底部
     def _append(self, widget: Widget) -> None:
@@ -237,8 +306,9 @@ class WeaveTuiApp(App[None]):
             "disconnected": "red",
             "connecting": "dim",
         }.get(state, "dim")
+        session = f"  [dim]{self._session_id}[/dim]" if self._session_id else ""
         header.update(
-            f"[bold]WeaveCode[/bold]  [dim]{self._host}:{self._port}[/dim]"
+            f"[bold]WeaveCode[/bold]  [dim]{self._host}:{self._port}[/dim]{session}"
             f"  [{color}]{state}[/{color}]"
         )
 
@@ -259,10 +329,57 @@ class WeaveTuiApp(App[None]):
             if task_id > 0 and status:
                 self._tasks().set_status(task_id, status)
 
-    # 管理 SocketClient 生命周期：连接、订阅事件、断线重连
+    # 退出前尽力关闭当前 session，失败也不阻塞 TUI 退出
+    async def action_quit(self) -> None:
+        if self._client is not None and self._session_id is not None:
+            try:
+                await self._client.send_command("session.close", {"session_id": self._session_id})
+            except (IpcError, RuntimeError, OSError):
+                self._append(Static("[yellow]warning: failed to close session[/yellow]"))
+        self.exit()
+
+    # 输入框提交：锁定输入、回显用户回合，再交给 worker 发送
+    async def on_chat_text_area_submitted(self, event: ChatTextArea.Submitted) -> None:
+        content = event.value.strip()
+        if not content:
+            return
+        if self._client is None or self._session_id is None or self._busy:
+            self._append(Static("[yellow]agent busy or disconnected[/yellow]", classes="log-line"))
+            return
+        self._busy = True
+        prompt = event.text_area
+        prompt.text = ""
+        prompt.disabled = True
+        prompt.read_only = False
+        prompt.border_title = "agent is working..."
+        self._append(Static(f"[bold]>[/bold] {content}", classes="user-turn"))
+        self._update_header("running")
+        self.run_worker(self._do_send_message(content), name="send_message", exclusive=False)
+
+    # 在 worker 中执行 IPC 发送，消息泵在 agent 运行期间保持畅通
+    async def _do_send_message(self, content: str) -> None:
+        if self._client is None:
+            return
+        try:
+            await self._client.send_command(
+                "session.send_message",
+                {"session_id": self._session_id, "content": content},
+            )
+        except (IpcError, RuntimeError, OSError) as e:
+            self._busy = False
+            prompt = self._prompt()
+            if prompt is not None:
+                prompt.disabled = False
+                prompt.read_only = False
+                prompt.border_title = _PROMPT_HINT
+            self._update_header("ready")
+            self._append(Static(f"[red]send error: {e}[/red]", classes="log-line"))
+
+    # 管理 SocketClient 生命周期：连接、订阅事件、创建会话、断线重连
     async def _socket_loop(self) -> None:
         while True:
             client = SocketClient(self._host, self._port)
+            self._client = None
             self._update_header("connecting")
             try:
                 await client.connect()
@@ -273,6 +390,7 @@ class WeaveTuiApp(App[None]):
                 continue
 
             log.info("connected to %s:%s", self._host, self._port)
+            self._client = client
             loop_task = asyncio.create_task(client.run_event_loop())
 
             async def on_event(event: dict[str, Any]) -> None:
@@ -282,20 +400,43 @@ class WeaveTuiApp(App[None]):
 
             try:
                 params: dict[str, Any] = {
-                    "topics": ["run.*", "step.*", "tool.*", "llm.token", "llm.usage"],
+                    "topics": [
+                        "session.*",
+                        "run.*",
+                        "step.*",
+                        "tool.*",
+                        "llm.token",
+                        "llm.usage",
+                    ],
                     "scope": "global",
                 }
                 if self._replay_run_id is not None:
                     params["replay_from_run"] = self._replay_run_id
                 await client.send_command("event.subscribe", params)
+                created = await client.send_command("session.create", {"mode": "chat"})
+                self._session_id = str(created["session_id"])
+                log.info("session created session_id=%s", self._session_id)
+                prompt = self._prompt()
+                if prompt is not None:
+                    prompt.disabled = False
+                    prompt.read_only = False
+                    prompt.border_title = _PROMPT_HINT
+                    prompt.focus()
                 self._update_header("ready")
                 await loop_task
             except IpcError as e:
-                log.error("subscribe error: %s", e)
+                log.error("session setup failed: %s", e)
             finally:
-                self._break_llm()
                 if not loop_task.done():
                     loop_task.cancel()
+                self._client = None
+                self._session_id = None
+                prompt = self._prompt()
+                if prompt is not None:
+                    prompt.disabled = True
+                    prompt.read_only = False
+                    prompt.border_title = "disconnected, retrying..."
+                self._break_llm()
                 await client.close()
 
             self._update_header("disconnected")
@@ -323,7 +464,26 @@ class WeaveTuiApp(App[None]):
 
         self._break_llm()
 
-        if t == "run.started":
+        if t == "session.waiting_for_input":
+            self._busy = False
+            prompt = self._prompt()
+            if prompt is not None:
+                prompt.disabled = False
+                prompt.read_only = False
+                prompt.border_title = _PROMPT_HINT
+                prompt.focus()
+            self._update_header("ready")
+
+        elif t == "session.closed":
+            self._busy = False
+            prompt = self._prompt()
+            if prompt is not None:
+                prompt.disabled = True
+                prompt.read_only = False
+                prompt.border_title = "session closed"
+            self._update_header("disconnected")
+
+        elif t == "run.started":
             run_id = event.get("run_id", "")
             goal = event.get("goal", "")
             self._update_header("running")
@@ -336,7 +496,6 @@ class WeaveTuiApp(App[None]):
             status = event.get("status", "")
             steps = event.get("steps", 0)
             reason = event.get("reason") or ""
-            self._update_header("ready")
             if status == "success":
                 self._append(Static(
                     f"[bold green]✓ completed[/bold green]  [dim]{steps} steps[/dim]",

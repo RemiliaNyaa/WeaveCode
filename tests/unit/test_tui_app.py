@@ -146,3 +146,43 @@ def test_unknown_event_silently_ignored() -> None:
 
     app._handle_event({"type": "some.unknown.type", "run_id": "r", "ts": "t"})
     assert appended == []
+
+# 功能：验证提交用户输入时会追加 user turn，并进入 busy 状态
+# 设计：用 fake client 替代 SocketClient，直接调用 on_chat_text_area_submitted，
+#       覆盖 TextArea 清空内容 + 设置 busy 占位符的核心状态迁移
+async def test_input_submit_appends_user_turn_and_disables_prompt() -> None:
+    class _FakeArea:
+        def __init__(self) -> None:
+            self.disabled = False
+            self.border_title = ""
+            self.text = "hello"
+
+    class _FakeEvent:
+        def __init__(self, area: _FakeArea) -> None:
+            self.value = area.text
+            self.text_area = area
+
+    class _FakeClient:
+        async def send_command(self, method: str, params: dict) -> dict:
+            return {"run_id": "run-1"}
+
+    app = WeaveTuiApp("127.0.0.1", 9999)
+    appended: list[Widget] = []
+    app._append = lambda w: appended.append(w)  # type: ignore[method-assign]
+    app._update_header = lambda state: None  # type: ignore[method-assign]
+    app._client = _FakeClient()  # type: ignore[assignment]
+    app._session_id = "sess-1"
+
+    area = _FakeArea()
+    event = _FakeEvent(area)
+    await app.on_chat_text_area_submitted(event)  # type: ignore[arg-type]
+
+    assert app._busy  # type: ignore[attr-defined]
+    assert area.disabled
+    assert area.text == ""
+    assert "agent is working" in area.border_title.lower()
+    assert appended[0].content == "[bold]>[/bold] hello"
+
+
+# 功能：验证未知事件类型不抛异常也不追加任何 widget
+# 设计：发送 type 为 unknown 的事件，断言 appended 为空

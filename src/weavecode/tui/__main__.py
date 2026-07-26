@@ -1,18 +1,39 @@
 from __future__ import annotations
 
 import argparse
+import logging
+import logging.handlers
+import os
+from pathlib import Path
 
+from weavecode.core.config import get_config
 from weavecode.tui.app import WeaveTuiApp
 
-_DEFAULT_HOST = "127.0.0.1"
-_DEFAULT_PORT = 7437
+_DEFAULT_TUI_LOG = "~/.weave/logs/tui.log"
 
 
-# weave-tui 启动入口：解析命令行参数后构造 WeaveTuiApp 并进入 Textual 事件循环
+# TUI 文件日志初始化：不写 stderr（避免干扰 Textual 渲染），只写滚动文件
+def _setup_logging(level: str) -> None:
+    log_path = Path(os.environ.get("WEAVE_TUI_LOG_FILE", _DEFAULT_TUI_LOG)).expanduser()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    handler = logging.handlers.RotatingFileHandler(
+        log_path, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+    )
+    handler.setFormatter(
+        logging.Formatter(
+            'level=%(levelname)s ts=%(asctime)s source=%(name)s msg="%(message)s"',
+            datefmt="%Y-%m-%dT%H:%M:%S",
+        )
+    )
+    root = logging.getLogger()
+    root.setLevel(getattr(logging, level.upper(), logging.DEBUG))
+    root.handlers.clear()
+    root.addHandler(handler)
+
+
+# weave-tui 入口：解析 --replay 参数后启动 TUI 应用
 def main() -> None:
     parser = argparse.ArgumentParser(prog="weave-tui", description="WeaveCode TUI")
-    parser.add_argument("--host", default=_DEFAULT_HOST, help="daemon host")
-    parser.add_argument("--port", type=int, default=_DEFAULT_PORT, help="daemon port")
     parser.add_argument(
         "--replay",
         metavar="RUN_ID",
@@ -20,7 +41,9 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    app = WeaveTuiApp(args.host, args.port, replay_run_id=args.replay)
+    config = get_config()
+    _setup_logging(config.logging.level)
+    app = WeaveTuiApp(config.host, config.port, replay_run_id=args.replay)
     app.run()
 
 
