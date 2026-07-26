@@ -98,16 +98,22 @@ class SessionManager:
                 content, run_id=run_id, session=session, store=self._store
             )
 
-            session.status = "waiting_for_input"
             session.updated_at = _now()
-            self._store.write_meta(session)
-            await self._bus.publish(
-                SessionWaitingForInputEvent(
-                    session_id=sid,
-                    last_run_id=run_id,
-                    ts=session.updated_at,
+            if session.mode == "one_shot":
+                session.status = "closed"
+                await self._bus.publish(
+                    SessionClosedEvent(session_id=sid, ts=session.updated_at)
                 )
-            )
+            else:
+                session.status = "waiting_for_input"
+                await self._bus.publish(
+                    SessionWaitingForInputEvent(
+                        session_id=sid,
+                        last_run_id=run_id,
+                        ts=session.updated_at,
+                    )
+                )
+            self._store.write_meta(session)
             return run_id
 
     # 关闭指定 session 并更新 meta.json
