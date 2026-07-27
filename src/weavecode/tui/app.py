@@ -26,6 +26,21 @@ def _preview(s: str, n: int) -> str:
     return s[:n] + "…" if len(s) > n else s
 
 
+# 从会话历史的消息内容里取出可展示的纯文本
+def _message_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and block.get("type") == "text":
+                parts.append(str(block.get("text", "")))
+        return "\n".join(parts)
+    return ""
+
+
 def _params_str(params: dict[str, Any]) -> str:
     return json.dumps(params, ensure_ascii=False, indent=2)
 
@@ -329,6 +344,33 @@ class WeaveTuiApp(App[None]):
             if task_id > 0 and status:
                 self._tasks().set_status(task_id, status)
 
+    # 把会话历史排进日志流：用户消息独立成回合，助手回复渲染成 Markdown
+    def _render_history(self, messages: list[dict[str, Any]]) -> None:
+        for message in messages:
+            role = str(message.get("role", ""))
+            text = _message_text(message.get("content"))
+            if not text:
+                continue
+            if role == "user":
+                self._append(Static(f"[bold]>[/bold] {text}", classes="user-turn"))
+            elif role == "assistant":
+                self._append(Static(Markdown(text, code_theme="monokai"), classes="log-line"))
+
+    # 取回会话历史并重建画面；连接建立与会话切换共用这一步
+    async def _load_history(self, session_id: str) -> None:
+        if self._client is None:
+            return
+        try:
+            history = await self._client.send_command(
+                "session.get_history", {"session_id": session_id}
+            )
+        except (IpcError, RuntimeError, OSError) as e:
+            log.warning("load history failed session_id=%s: %s", session_id, e)
+            return
+        messages = history.get("messages") or []
+        if messages:
+            self._render_history(messages)
+
     # 退出前尽力关闭当前 session，失败也不阻塞 TUI 退出
     async def action_quit(self) -> None:
         if self._client is not None and self._session_id is not None:
@@ -416,6 +458,7 @@ class WeaveTuiApp(App[None]):
                 created = await client.send_command("session.create", {"mode": "chat"})
                 self._session_id = str(created["session_id"])
                 log.info("session created session_id=%s", self._session_id)
+                await self._load_history(self._session_id)
                 prompt = self._prompt()
                 if prompt is not None:
                     prompt.disabled = False
@@ -473,6 +516,19 @@ class WeaveTuiApp(App[None]):
                 prompt.border_title = _PROMPT_HINT
                 prompt.focus()
             self._update_header("ready")
+
+        elif t == "session.resumed":
+            session_id = str(event.get("session_id", ""))
+            if session_id and session_id != self._session_id:
+                self._session_id = session_id
+                self._update_header("ready")
+                self._append(Static(
+                    f"[dim]── session {session_id} ──[/dim]",
+                    classes="log-line",
+                ))
+                self.run_worker(
+                    self._load_history(session_id), name="history", exclusive=True
+                )
 
         elif t == "session.closed":
             self._busy = False
