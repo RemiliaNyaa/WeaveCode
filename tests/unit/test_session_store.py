@@ -98,3 +98,32 @@ def test_thread_roundtrip_with_tool_blocks(tmp_path: Path) -> None:
             "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}],
         },
     ]
+
+
+# 功能：尾部未配对的 tool_use 会被裁掉
+# 设计：构造一条没有 tool_result 的 assistant tool_use，断言只返回配平之前的内容，避免 API 报 messages.invalid
+def test_read_messages_trims_orphan_tool_use_tail(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.write_meta(_session())
+    store.append_message("sess-1", "user", "hello")
+    store.append_message(
+        "sess-1",
+        "assistant",
+        [{"type": "tool_use", "id": "orphan", "name": "read_file", "input": {}}],
+        run_id="run-1",
+    )
+
+    assert store.read_messages("sess-1") == [{"role": "user", "content": "hello"}]
+
+
+# 功能：write_compacted 用压缩后的消息整体替换 thread（旧消息不再出现）
+# 设计：先写两条旧消息、再写一条压缩结果，断言只剩那一条——覆盖「先 DELETE 再重插」这条路径
+def test_write_compacted_replaces_thread(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.write_meta(_session())
+    store.append_message("sess-1", "user", "old-1")
+    store.append_message("sess-1", "assistant", "old-2")
+
+    store.write_compacted("sess-1", [{"role": "user", "content": "summary"}])
+
+    assert store.read_messages("sess-1") == [{"role": "user", "content": "summary"}]

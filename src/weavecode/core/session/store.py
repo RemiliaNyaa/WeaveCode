@@ -92,6 +92,28 @@ class SessionStore:
             if role not in ("user", "assistant"):
                 continue
             messages.append({"role": role, "content": row.get("content", "")})
+        return self._trim_orphan_tool_use(messages)
+
+    # 裁掉尾部未配对 tool_use 以及其后的消息，避免 Anthropic messages.invalid
+    def _trim_orphan_tool_use(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        pending: set[str] = set()
+        last_balanced = 0
+        for idx, msg in enumerate(messages, start=1):
+            content = msg.get("content")
+            if isinstance(content, list):
+                if msg.get("role") == "assistant":
+                    for block in content:
+                        if block.get("type") == "tool_use":
+                            pending.add(str(block.get("id", "")))
+                elif msg.get("role") == "user":
+                    for block in content:
+                        if block.get("type") == "tool_result":
+                            pending.discard(str(block.get("tool_use_id", "")))
+            if not pending:
+                last_balanced = idx
+        if pending:
+            logger.warning("trim orphan tool_use blocks from thread")
+            return messages[:last_balanced]
         return messages
 
     # 读取会话笔记；文件不存在时返回空字符串
