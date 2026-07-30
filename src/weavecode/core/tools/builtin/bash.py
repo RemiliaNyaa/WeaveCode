@@ -45,24 +45,32 @@ class BashTool(BaseTool):
         command = p.command
         timeout = p.timeout
 
-        proc = await asyncio.create_subprocess_shell(
-            command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
         try:
-            stdout_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        except TimeoutError:
-            proc.kill()
-            await proc.communicate()
-            return ToolResult(
-                content=f"[timeout after {timeout}s]",
-                is_error=True,
-                error_type="timeout",
+            proc = await asyncio.create_subprocess_shell(
+                command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
             )
+            try:
+                stdout_bytes, _ = await asyncio.wait_for(
+                    proc.communicate(), timeout=timeout
+                )
+            except TimeoutError:
+                proc.kill()
+                await proc.communicate()
+                return ToolResult(
+                    content=f"[timeout after {timeout}s]",
+                    is_error=True,
+                    error_type="timeout",
+                )
+        except Exception as exc:
+            return ToolResult(content=str(exc), is_error=True, error_type="runtime_error")
 
-        output = stdout_bytes.decode("utf-8")
-        if len(stdout_bytes) > _MAX_OUTPUT_BYTES:
+        # 容错解码：坏字节用替换字符兜底；子进程输出的 CRLF 统一成 \n
+        output = stdout_bytes.decode("utf-8", errors="replace").replace("\r\n", "\n")
+
+        truncated = len(stdout_bytes) > _MAX_OUTPUT_BYTES
+        if truncated:
             output = output[:_MAX_OUTPUT_BYTES] + "\n[truncated]"
 
         returncode = proc.returncode or 0

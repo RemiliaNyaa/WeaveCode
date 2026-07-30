@@ -15,12 +15,16 @@ MessageContent = str | list[dict[str, Any]]
 _DEFAULT_ROOT = "~/.weave/sessions"
 
 
+# 统一把 CRLF / CR 行尾折成 LF，避免会话文件混用两种行尾
+def _normalize_newlines(text: str) -> str:
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
 class SessionStore:
-    # 初始化会话存储：根目录默认 ~/.weave/sessions，不存在则创建
+    # 初始化会话存储：根目录默认 ~/.weave/sessions，展开 ~ 并规范化成绝对路径
     def __init__(self, root: str | Path | None = None) -> None:
-        self._root = (
-            Path(root).expanduser() if root is not None else Path(_DEFAULT_ROOT).expanduser()
-        )
+        base = Path(root) if root is not None else Path(_DEFAULT_ROOT)
+        self._root = base.expanduser().resolve()
         self._root.mkdir(parents=True, exist_ok=True)
 
     # 会话目录：<root>/<sid>
@@ -59,11 +63,11 @@ class SessionStore:
     ) -> None:
         self.append_messages(sid, [{"role": role, "content": content}], run_id=run_id or "")
 
-    # 批量追加一次 run 新产生的消息，按行写入 thread.jsonl
+    # 批量追加一次 run 新产生的消息，按行写入 thread.jsonl（行尾固定为 LF）
     def append_messages(self, sid: str, messages: list[dict[str, Any]], run_id: str = "") -> None:
         directory = self.session_dir(sid)
         directory.mkdir(parents=True, exist_ok=True)
-        with (directory / "thread.jsonl").open("a", encoding="utf-8") as fh:
+        with (directory / "thread.jsonl").open("a", encoding="utf-8", newline="\n") as fh:
             for msg in messages:
                 row: dict[str, Any] = {
                     "role": msg.get("role", ""),
@@ -80,7 +84,7 @@ class SessionStore:
             return []
 
         messages: list[dict[str, Any]] = []
-        for line_no, line in enumerate(path.read_text(encoding="utf-8").split("\n"), start=1):
+        for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
             if not line:
                 continue
             try:
@@ -116,6 +120,22 @@ class SessionStore:
             return messages[:last_balanced]
         return messages
 
+    # 用压缩后的消息整体覆盖 thread.jsonl，原文件先改名备份成 thread_<时间戳>.jsonl.bak
+    def write_compacted(self, sid: str, messages: list[dict[str, Any]]) -> None:
+        directory = self.session_dir(sid)
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / "thread.jsonl"
+        if path.exists():
+            stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+            path.replace(directory / f"thread_{stamp}.jsonl.bak")
+        with path.open("w", encoding="utf-8", newline="\n") as fh:
+            for msg in messages:
+                row: dict[str, Any] = {
+                    "role": msg.get("role", ""),
+                    "content": msg.get("content", ""),
+                }
+                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+
     # 读取会话笔记；文件不存在时返回空字符串
     def read_notes(self, sid: str) -> str:
         path = self.session_dir(sid) / "notes.md"
@@ -129,6 +149,7 @@ class SessionStore:
         directory.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now(UTC).isoformat()
         attribution = f"<!-- {stamp}" + (f" run={run_id}" if run_id else "") + " -->"
-        heading = title.strip() or "note"
-        with (directory / "notes.md").open("a", encoding="utf-8") as fh:
-            fh.write(f"\n{attribution}\n## {heading}\n\n{content.strip()}\n")
+        heading = _normalize_newlines(title).strip() or "note"
+        body = _normalize_newlines(content).strip()
+        with (directory / "notes.md").open("a", encoding="utf-8", newline="\n") as fh:
+            fh.write(f"\n{attribution}\n## {heading}\n\n{body}\n")

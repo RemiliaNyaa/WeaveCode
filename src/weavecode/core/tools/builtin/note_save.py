@@ -16,6 +16,11 @@ class NoteSaveParams(BaseModel):
     content: str
 
 
+# 把 CRLF / CR 行尾统一折成 LF，避免 notes 文件混用两种行尾
+def _normalize(text: str) -> str:
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
 class NoteSaveTool(BaseTool):
     """会话笔记工具：把模型给出的笔记追加写入当前会话的 notes 文件。"""
 
@@ -47,12 +52,13 @@ class NoteSaveTool(BaseTool):
     # 追加一条笔记；正文为空按参数错误回填，不写文件
     async def invoke(self, params: dict[str, object]) -> ToolResult:
         p = NoteSaveParams.model_validate(params)
-        content = p.content.strip()
+        title = _normalize(p.title).strip()
+        content = _normalize(p.content).strip()
         if not content:
             return ToolResult(
                 content="content must not be empty",
                 is_error=True,
                 error_type="schema_error",
             )
-        self._store.append_note(self._session_id, p.title, content, self._run_id)
+        self._store.append_note(self._session_id, title, content, self._run_id)
         return ToolResult(content="saved")

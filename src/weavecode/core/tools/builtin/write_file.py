@@ -37,12 +37,16 @@ class WriteFileTool(BaseTool):
         "required": ["path", "content"],
     }
 
-    # 写入文件（已存在即整体覆盖）；参数由 WriteFileParams 统一校验，超 1 MB 拒绝
+    # 写入文件（已存在即整体覆盖）；路径按工作目录规范化，行尾按内容原样落盘
     async def invoke(self, params: dict[str, object]) -> ToolResult:
         p = WriteFileParams.model_validate(params)
-        path = Path(p.path)
-        if ".." in path.parts:
+        if ".." in Path(p.path).parts:
             raise PermissionError(f"path traversal not allowed: {p.path}")
+
+        path = Path(p.path)
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        path = path.resolve()
 
         encoded = p.content.encode("utf-8")
         if len(encoded) > _MAX_BYTES:
@@ -52,5 +56,7 @@ class WriteFileTool(BaseTool):
                 error_type="runtime_error",
             )
 
-        path.write_text(p.content, encoding="utf-8")
+        # newline="" 关掉文本模式的行尾翻译：内容里是 \n 就写 \n，是 \r\n 就写 \r\n
+        with path.open("w", encoding="utf-8", newline="") as f:
+            f.write(p.content)
         return ToolResult(content=f"wrote {len(encoded)} bytes to {path}")

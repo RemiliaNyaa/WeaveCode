@@ -42,19 +42,23 @@ class ListDirTool(BaseTool):
         "required": ["path"],
     }
 
-    # 树状递归展示目录：层级前缀 + 目录斜杠，默认深度 2，按 200 条截断
+    # 树状递归展示目录：路径按工作目录规范化，默认深度 2，按 200 条截断
     async def invoke(self, params: dict[str, object]) -> ToolResult:
         p = ListDirParams.model_validate(params)
         if ".." in Path(p.path).parts:
             raise PermissionError(f"path traversal not allowed: {p.path}")
 
         root = Path(p.path)
+        if not root.is_absolute():
+            root = Path.cwd() / root
+        root = root.resolve()
+
         if not root.exists():
             raise FileNotFoundError(f"directory not found: {p.path}")
         if not root.is_dir():
             raise NotADirectoryError(f"not a directory: {p.path}")
 
-        lines = [f"{p.path}/"]
+        lines = [f"{root}/"]
         _render(root, "", 0, p.max_depth, lines)
         return ToolResult(content="\n".join(lines))
 
