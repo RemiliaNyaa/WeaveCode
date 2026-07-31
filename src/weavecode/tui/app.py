@@ -21,6 +21,16 @@ from weavecode.core.transport.socket_client import IpcError, SocketClient
 # 输入框解锁后的边框标题
 _PROMPT_HINT = "type a message — enter to send, ⌘/⇧/⌥+enter for newline"
 
+# 字段收敛前后的名字对照：老字段名进、统一后的新字段名出
+_FIELD_ALIASES: dict[str, str] = {
+    "run": "run_id",
+    "tool": "tool_name",
+    "text": "token",
+    "elapsed": "elapsed_ms",
+    "error": "error_message",
+    "timestamp": "ts",
+}
+
 
 def _preview(s: str, n: int) -> str:
     return s[:n] + "…" if len(s) > n else s
@@ -485,10 +495,25 @@ class WeaveTuiApp(App[None]):
             self._update_header("disconnected")
             await asyncio.sleep(2)
 
+    # 序列化差异在分发入口抹平，下游分支只按统一后的新字段名读事件载荷
+    def _normalize_event(self, event: dict[str, Any]) -> dict[str, Any]:
+        data = event.get("data")
+        if isinstance(data, dict):
+            merged = dict(data)
+            merged.setdefault("type", event.get("type", ""))
+            event = merged
+        normalized = dict(event)
+        for old, new in _FIELD_ALIASES.items():
+            if old in normalized and new not in normalized:
+                normalized[new] = normalized.pop(old)
+        normalized.setdefault("type", "")
+        normalized.setdefault("ts", "")
+        return normalized
+
     # 根据事件 type 路由到对应渲染逻辑；单个事件渲染失败不会掀翻 socket loop
     def _handle_event(self, event: dict[str, Any]) -> None:
         try:
-            self._handle_event_inner(event)
+            self._handle_event_inner(self._normalize_event(event))
         except Exception:
             log.exception("_handle_event crashed  event_type=%s", event.get("type", "?"))
 

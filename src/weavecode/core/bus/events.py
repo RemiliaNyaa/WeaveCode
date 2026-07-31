@@ -15,7 +15,7 @@ class RunStartedEvent(BaseModel):
     type: Literal["run.started"] = "run.started"
     run_id: str
     goal: str
-    ts: str = ""  # ISO 8601
+    ts: str  # ISO 8601
 
 
 class RunFinishedEvent(BaseModel):
@@ -24,21 +24,21 @@ class RunFinishedEvent(BaseModel):
     status: str  # "success" | "failed"
     reason: str | None = None  # "exceeded_max_steps" | "cancelled" | "llm_error" | ...
     steps: int
-    ts: str = ""
+    ts: str
 
 
 class StepStartedEvent(BaseModel):
     type: Literal["step.started"] = "step.started"
     run_id: str
     step: int
-    ts: str = ""
+    ts: str
 
 
 class StepFinishedEvent(BaseModel):
     type: Literal["step.finished"] = "step.finished"
     run_id: str
     step: int
-    ts: str = ""
+    ts: str
 
 
 class ToolCallStartedEvent(BaseModel):
@@ -47,7 +47,7 @@ class ToolCallStartedEvent(BaseModel):
     tool_use_id: str
     tool_name: str
     params: dict[str, Any]
-    ts: str = ""
+    ts: str
 
 
 class ToolCallFinishedEvent(BaseModel):
@@ -57,7 +57,7 @@ class ToolCallFinishedEvent(BaseModel):
     tool_name: str
     elapsed_ms: int
     output: str = ""  # tool result content, for TUI display
-    ts: str = ""
+    ts: str
 
 
 class ToolCallFailedEvent(BaseModel):
@@ -70,14 +70,14 @@ class ToolCallFailedEvent(BaseModel):
     error_message: str
     elapsed_ms: int
     attempt: int = 1  # 1=first attempt, 2=first retry, 3=second retry
-    ts: str = ""
+    ts: str
 
 
 class LlmTokenEvent(BaseModel):
     type: Literal["llm.token"] = "llm.token"
     run_id: str
     token: str
-    ts: str = ""
+    ts: str
 
 
 class LlmUsageEvent(BaseModel):
@@ -87,7 +87,7 @@ class LlmUsageEvent(BaseModel):
     output_tokens: int
     cache_read_input_tokens: int
     cache_creation_input_tokens: int
-    ts: str = ""
+    ts: str
 
 
 class LlmModelSelectedEvent(BaseModel):
@@ -95,7 +95,7 @@ class LlmModelSelectedEvent(BaseModel):
     run_id: str
     model: str
     strategy: str  # "static" | "rule_based" | "cost_budget"
-    ts: str = ""
+    ts: str
 
 
 class LogLineEvent(BaseModel):
@@ -104,40 +104,40 @@ class LogLineEvent(BaseModel):
     level: str  # "DEBUG" | "INFO" | "WARNING" | "ERROR"
     source: str
     message: str
-    ts: str = ""
+    ts: str
 
 
 class SessionCreatedEvent(BaseModel):
     type: Literal["session.created"] = "session.created"
     session_id: str
     mode: str
-    ts: str = ""
+    ts: str
 
 
 class SessionMessageReceivedEvent(BaseModel):
     type: Literal["session.message_received"] = "session.message_received"
     session_id: str
     content: str
-    ts: str = ""
+    ts: str
 
 
 class SessionWaitingForInputEvent(BaseModel):
     type: Literal["session.waiting_for_input"] = "session.waiting_for_input"
     session_id: str
     last_run_id: str
-    ts: str = ""
+    ts: str
 
 
 class SessionResumedEvent(BaseModel):
     type: Literal["session.resumed"] = "session.resumed"
     session_id: str
-    ts: str = ""
+    ts: str
 
 
 class SessionClosedEvent(BaseModel):
     type: Literal["session.closed"] = "session.closed"
     session_id: str
-    ts: str = ""
+    ts: str
 
 
 # 根据 type 字段决定事件类型的判别联合

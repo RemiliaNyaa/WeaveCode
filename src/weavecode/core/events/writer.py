@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 from pathlib import Path
 from typing import TextIO
@@ -10,6 +9,12 @@ from pydantic import BaseModel
 from weavecode.core.events.bus import EventBus
 
 logger = logging.getLogger(__name__)
+
+
+# 取事件的类型名（bus 事件都带 type 字段；没有该字段时退回类名）
+def _event_type(event: BaseModel) -> str:
+    value = getattr(event, "type", None)
+    return value if isinstance(value, str) else type(event).__name__
 
 
 class EventWriter:
@@ -35,11 +40,10 @@ class EventWriter:
         if self._file is None:
             return
         try:
-            line = json.dumps(event.model_dump(), ensure_ascii=False)
-            self._file.write(line + "\n")
+            self._file.write(event.model_dump_json() + "\n")
             self._file.flush()
         except (OSError, ValueError) as e:
-            logger.error("EventWriter: failed to write %s: %s", type(event).__name__, e)
+            logger.error("EventWriter: failed to write %s: %s", _event_type(event), e)
 
     # 将 handle 注册为 bus 的订阅者
     def subscribe(self, bus: EventBus) -> None:
