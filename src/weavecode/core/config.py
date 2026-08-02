@@ -45,6 +45,12 @@ class TraceConfig:
 
 
 @dataclass
+class PermissionConfig:
+    timeout_s: float = 60.0  # 审批超时秒数；0 表示不超时
+    persist: bool = True  # 是否把「始终允许」的审批决定写入 policy.toml
+
+
+@dataclass
 class WeaveConfig:
     host: str = _DEFAULT_HOST
     port: int = _DEFAULT_PORT
@@ -52,6 +58,7 @@ class WeaveConfig:
     agent: AgentConfig = field(default_factory=AgentConfig)
     llm: LlmConfig = field(default_factory=LlmConfig)
     trace: TraceConfig = field(default_factory=TraceConfig)
+    permission: PermissionConfig = field(default_factory=PermissionConfig)
 
 
 # 构建并返回运行时配置：默认值 → TOML → .env → WEAVE_* 环境变量（后者优先级最高）
@@ -186,6 +193,14 @@ def _apply_toml(config: WeaveConfig, data: dict[str, Any]) -> None:
     if payload is not None:
         config.trace.include_llm_payload = payload
 
+    perm = _section(data, "permission")
+    timeout_s = _read_float(perm, "timeout_s", "permission.timeout_s")
+    if timeout_s is not None:
+        config.permission.timeout_s = timeout_s
+    persist = _read_bool(perm, "persist", "permission.persist")
+    if persist is not None:
+        config.permission.persist = persist
+
 
 # 用 WEAVE_* 环境变量覆盖 config 中对应字段（若变量已设置）
 def _apply_env(config: WeaveConfig) -> None:
@@ -242,3 +257,28 @@ def _apply_env(config: WeaveConfig) -> None:
     trace_payload = os.environ.get("WEAVE_TRACE_INCLUDE_LLM_PAYLOAD")
     if trace_payload is not None:
         config.trace.include_llm_payload = trace_payload.lower() not in ("0", "false", "no")
+
+    perm_timeout = os.environ.get("WEAVE_PERMISSION_TIMEOUT_S")
+    if perm_timeout is not None:
+        try:
+            perm_timeout_val = float(perm_timeout)
+            if perm_timeout_val < 0:
+                raise SystemExit(
+                    f"Config error: WEAVE_PERMISSION_TIMEOUT_S must be >= 0, got: {perm_timeout!r}"
+                )
+            config.permission.timeout_s = perm_timeout_val
+        except ValueError:
+            raise SystemExit(
+                f"Config error: WEAVE_PERMISSION_TIMEOUT_S must be a number, got: {perm_timeout!r}"
+            )
+
+    perm_persist = os.environ.get("WEAVE_PERMISSION_PERSIST")
+    if perm_persist is not None:
+        if perm_persist.strip().lower() in ("1", "true", "yes", "on"):
+            config.permission.persist = True
+        elif perm_persist.strip().lower() in ("0", "false", "no", "off"):
+            config.permission.persist = False
+        else:
+            raise SystemExit(
+                f"Config error: WEAVE_PERMISSION_PERSIST must be a boolean, got: {perm_persist!r}"
+            )
