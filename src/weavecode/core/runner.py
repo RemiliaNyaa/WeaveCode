@@ -14,6 +14,7 @@ from weavecode.core.events.writer import EventWriter
 from weavecode.core.llm.base import LLMProvider
 from weavecode.core.llm.provider import AnthropicProvider
 from weavecode.core.loop import AgentLoop
+from weavecode.core.permissions.manager import PermissionManager
 from weavecode.core.runs import RUNS_DIR, new_run_id
 from weavecode.core.session.model import Session
 from weavecode.core.session.store import SessionStore
@@ -57,6 +58,7 @@ class AgentRunner:
         provider: LLMProvider | None = None,
         extra_handlers: list[EventHandler] | None = None,
         trace: TraceWriter | None = None,
+        permission_manager: PermissionManager | None = None,
         runs_dir: Path | None = None,
     ) -> None:
         self._config = config
@@ -64,6 +66,7 @@ class AgentRunner:
         self._provider = provider
         self._extra_handlers: list[EventHandler] = extra_handlers or []
         self._trace = trace
+        self._permission_manager = permission_manager
         self._runs_dir = runs_dir if runs_dir is not None else RUNS_DIR
 
     # 执行一次 agent run（委托给 run_and_capture）
@@ -130,7 +133,12 @@ class AgentRunner:
                     task_manager, run_id=run_id, session=session, store=store
                 )
                 loop = AgentLoop(
-                    provider, registry, bus, tasks=task_manager, session_id=session_id
+                    provider,
+                    registry,
+                    bus,
+                    tasks=task_manager,
+                    session_id=session_id,
+                    permission_manager=self._permission_manager,
                 )
                 await loop.run(context)
             except asyncio.CancelledError:

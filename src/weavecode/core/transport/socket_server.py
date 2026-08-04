@@ -12,7 +12,6 @@ from pydantic import BaseModel, ValidationError
 
 from weavecode.core.bus.envelope import (
     INTERNAL_ERROR,
-    INVALID_PARAMS,
     INVALID_REQUEST,
     METHOD_NOT_FOUND,
     PARSE_ERROR,
@@ -82,7 +81,7 @@ class SocketServer:
         self._server.close()
         await self._server.wait_closed()
 
-    # 处理单个客户端连接，完成后清理订阅并关闭写流
+    # 处理单个客户端连接，完成后清理该连接的订阅与写流
     async def _handle_connection(
         self,
         reader: asyncio.StreamReader,
@@ -95,7 +94,10 @@ class SocketServer:
         finally:
             if self._broadcaster is not None:
                 self._broadcaster.unsubscribe(writer)
-            writer.close()
+            try:
+                writer.close()
+            except Exception:
+                pass
             logger.debug("client disconnected: %s", peer)
 
     # 持续读取换行分隔的 JSON 行并逐行分发处理
@@ -105,10 +107,18 @@ class SocketServer:
         writer: asyncio.StreamWriter,
     ) -> None:
         while True:
-            line = await reader.readline()
+            try:
+                line = await reader.readline()
+            except asyncio.LimitOverrunError:
+                await self._send(writer, make_error(None, INVALID_REQUEST, "Request too large"))
+                return
+
             if not line:
                 return
-            await self._handle_line(line, writer)
+
+            # 每条命令独立作为 task 执行，避免长时间运行的 handler（如 session.send_message）
+            # 阻塞读循环，使 permission.respond 等并发命令能被及时处理
+            asyncio.create_task(self._handle_line(line, writer))
 
     # 解析单行 JSON-RPC 请求并调用对应 handler，将结果或错误写回客户端
     async def _handle_line(self, line: bytes, writer: asyncio.StreamWriter) -> None:
@@ -152,14 +162,21 @@ class SocketServer:
             await self._send(writer, make_error(req.id, e.code, str(e), e.data))
             return
         except ValidationError as e:
-            await self._send(writer, make_error(req.id, INVALID_PARAMS, "Invalid params", str(e)))
+            await self._send(
+                writer,
+                make_error(req.id, INVALID_REQUEST, "Invalid params", str(e)),
+            )
             return
         except Exception as e:
             logger.exception("handler %s raised: %s", req.method, e)
             await self._send(writer, make_error(req.id, INTERNAL_ERROR, "Internal error"))
             return
 
-        await self._send(writer, JsonRpcSuccess(id=req.id, result=result.model_dump()))
+        result_data: Any = result.model_dump() if isinstance(result, BaseModel) else result
+        try:
+            await self._send(writer, JsonRpcSuccess(id=req.id, result=result_data))
+        except (ConnectionResetError, BrokenPipeError, OSError):
+            logger.debug("client disconnected before response for %s", req.method)
 
     # 将 pydantic 消息序列化为 JSON 行并写入流，随后刷新缓冲区
     async def _send(self, writer: asyncio.StreamWriter, msg: BaseModel) -> None:
