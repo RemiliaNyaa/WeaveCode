@@ -203,6 +203,132 @@ class TaskListBlock(Static):
         self.update("\n".join(lines))
 
 
+class PermissionSelect(Static):
+    """内联权限选择控件：挂载在日志流里，键盘焦点无需 ModalScreen。"""
+
+    can_focus = True
+
+    DEFAULT_CSS = """
+    PermissionSelect {
+        height: auto;
+        padding: 0 2;
+        margin-bottom: 1;
+    }
+    """
+
+    _CHOICES: tuple[tuple[str, str, str], ...] = (
+        ("allow_once", "Allow once", "y / 1"),
+        ("always_allow", "Always allow", "a / 2"),
+        ("reject_once", "Reject", "n / 3"),
+    )
+    _KEY_MAP: dict[str, str] = {
+        "y": "allow_once",
+        "1": "allow_once",
+        "a": "always_allow",
+        "2": "always_allow",
+        "n": "reject_once",
+        "3": "reject_once",
+    }
+
+    # 用户作出权限决策时发布，携带工具 ID 和决策字符串
+    class Decided(Message):
+        def __init__(self, widget: PermissionSelect, tool_use_id: str, decision: str) -> None:
+            self.widget = widget
+            self.tool_use_id = tool_use_id
+            self.decision = decision
+            super().__init__()
+
+    # 初始化控件，存储工具 ID（用于 IPC 回执）
+    def __init__(self, tool_use_id: str) -> None:
+        super().__init__("")
+        self._tool_use_id = tool_use_id
+        self._cursor = 0
+
+    # 挂载后渲染选项并把键盘焦点抢过来
+    def on_mount(self) -> None:
+        self.update(self._render_ui())
+        self.focus()
+
+    # 生成带光标高亮的选项列表文本
+    def _render_ui(self) -> str:
+        lines: list[str] = []
+        for i, (_, label, key_hint) in enumerate(self._CHOICES):
+            if i == self._cursor:
+                lines.append(f"  [bold cyan]❯ {label}[/bold cyan]  [dim]{key_hint}[/dim]")
+            else:
+                lines.append(f"    {label}  [dim]{key_hint}[/dim]")
+        lines.append("[dim]  ↑↓ navigate   enter confirm[/dim]")
+        return "\n".join(lines)
+
+    # 方向键导航；快捷键直接选择；enter 确认光标位置
+    def on_key(self, event: events.Key) -> None:
+        key = event.key
+        if key in ("up", "k"):
+            event.stop()
+            self._cursor = (self._cursor - 1) % len(self._CHOICES)
+            self.update(self._render_ui())
+        elif key in ("down", "j"):
+            event.stop()
+            self._cursor = (self._cursor + 1) % len(self._CHOICES)
+            self.update(self._render_ui())
+        elif key == "enter":
+            event.stop()
+            self._pick(self._CHOICES[self._cursor][0])
+        else:
+            decision = self._KEY_MAP.get(key)
+            if decision is not None:
+                event.stop()
+                self._pick(decision)
+
+    # 发布决策消息，由宿主 App 负责 IPC 回执和控件清理
+    def _pick(self, decision: str) -> None:
+        self.post_message(self.Decided(self, self._tool_use_id, decision))
+
+
+class PermissionBlock(Static):
+    """日志里的权限审批摘要"""
+
+    _LABEL_MAP: dict[str, str] = {
+        "allow_once": "allowed (once)",
+        "always_allow": "always allowed",
+        "reject_once": "rejected",
+        "timeout": "timed out",
+    }
+
+    # 子类提交消息：用户作出权限决策时发布
+    class Resolved(Message):
+        def __init__(self, block: PermissionBlock, decision: str) -> None:
+            self.block = block
+            self.decision = decision
+            super().__init__()
+
+    # 初始化审批块，记录工具 ID、名称和参数预览
+    def __init__(self, tool_use_id: str, tool_name: str, param_preview: str) -> None:
+        self._tool_use_id = tool_use_id
+        self._tool_name = tool_name
+        self._param_preview = param_preview
+        self._resolved = False
+        super().__init__(self._pending_text(), classes="log-line")
+
+    def _pending_text(self) -> str:
+        preview = f"  [dim]{self._param_preview}[/dim]" if self._param_preview else ""
+        return f"[bold red]? permission[/bold red]  [bold]{self._tool_name}[/bold]{preview}"
+
+    # 将块收缩为单行摘要并发布 Resolved 消息
+    def _resolve(self, decision: str) -> None:
+        if self._resolved:
+            return
+        self._resolved = True
+        allowed = decision in ("allow_once", "always_allow")
+        icon = "[bold green]✓[/bold green]" if allowed else "[bold red]✗[/bold red]"
+        label = self._LABEL_MAP.get(decision, decision)
+        preview = f"  [dim]{self._param_preview}[/dim]" if self._param_preview else ""
+        self.update(
+            f"{icon} permission  [bold]{self._tool_name}[/bold]{preview}  [dim]{label}[/dim]"
+        )
+        self.post_message(self.Resolved(self, decision))
+
+
 class ChatTextArea(TextArea):
     """支持 Enter 提交、Cmd/Shift/Alt+Enter 换行的多行聊天输入框。"""
 
@@ -286,6 +412,7 @@ class WeaveTuiApp(App[None]):
         self._busy = False
         self._current_llm: LLMStreamBlock | None = None
         self._pending_tool_blocks: dict[str, ToolCallBlock] = {}
+        self._pending_permission_blocks: dict[str, PermissionBlock] = {}
         self._task_list: TaskListBlock | None = None
 
     def compose(self) -> ComposeResult:
@@ -381,6 +508,42 @@ class WeaveTuiApp(App[None]):
         if messages:
             self._render_history(messages)
 
+    # 把选择控件挂到 Screen 顶层（#prompt 之前），避免 VerticalScroll 争抢焦点
+    def _mount_permission_select(self, select: PermissionSelect) -> None:
+        self.mount(select, before="#prompt")
+
+    # 全部待审批都处理完后重新解锁输入框
+    def _unlock_prompt(self) -> None:
+        if self._pending_permission_blocks:
+            return
+        prompt = self._prompt()
+        if prompt is not None:
+            prompt.disabled = False
+            prompt.read_only = False
+            prompt.border_title = _PROMPT_HINT
+            prompt.focus()
+
+    # 处理内联审批控件的用户决策：发送 IPC 回执并就地改写回执行
+    async def on_permission_select_decided(self, msg: PermissionSelect.Decided) -> None:
+        tool_use_id = msg.tool_use_id
+        decision = msg.decision
+        try:
+            msg.widget.remove()
+            perm_block = self._pending_permission_blocks.pop(tool_use_id, None)
+            if perm_block is not None:
+                perm_block._resolve(decision)
+            if self._client is not None:
+                try:
+                    await self._client.send_command(
+                        "permission.respond",
+                        {"tool_use_id": tool_use_id, "decision": decision},
+                    )
+                except (IpcError, RuntimeError, OSError):
+                    pass
+            self._unlock_prompt()
+        except Exception:
+            log.exception("permission respond failed tool_use_id=%s", tool_use_id)
+
     # 退出前尽力关闭当前 session，失败也不阻塞 TUI 退出
     async def action_quit(self) -> None:
         if self._client is not None and self._session_id is not None:
@@ -459,6 +622,7 @@ class WeaveTuiApp(App[None]):
                         "tool.*",
                         "llm.token",
                         "llm.usage",
+                        "permission.*",
                     ],
                     "scope": "global",
                 }
@@ -563,6 +727,32 @@ class WeaveTuiApp(App[None]):
                 prompt.read_only = False
                 prompt.border_title = "session closed"
             self._update_header("disconnected")
+
+        elif t == "permission.requested":
+            tool_use_id = str(event.get("tool_use_id", ""))
+            tool_name = str(event.get("tool_name", ""))
+            param_preview = str(event.get("param_preview", ""))
+            perm_block = PermissionBlock(tool_use_id, tool_name, param_preview)
+            self._pending_permission_blocks[tool_use_id] = perm_block
+            prompt = self._prompt()
+            if prompt is not None:
+                prompt.disabled = True
+                prompt.border_title = "permission required"
+            self._append(perm_block)
+            self._mount_permission_select(PermissionSelect(tool_use_id))
+
+        elif t == "permission.denied":
+            tool_use_id = str(event.get("tool_use_id", ""))
+            decision = str(event.get("decision", "denied"))
+            if tool_use_id in self._pending_permission_blocks:
+                perm_block = self._pending_permission_blocks.pop(tool_use_id)
+                perm_block._resolve(decision)
+                try:
+                    select = self.query_one(PermissionSelect)
+                    select.remove()
+                except Exception:
+                    pass
+                self._unlock_prompt()
 
         elif t == "run.started":
             run_id = event.get("run_id", "")
