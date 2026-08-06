@@ -33,7 +33,7 @@ class _PendingRequest:
     tool_name: str
 
 
-# 管理工具调用权限：静态规则判定 + 用户审批挂起 + 持久化的「始终允许」+ 超时
+# 管理工具调用权限：静态规则判定 + 用户审批挂起 + 会话级/持久化两级「始终」缓存 + 超时
 class PermissionManager:
     def __init__(
         self,
@@ -45,7 +45,9 @@ class PermissionManager:
         self._policies: dict[str, ToolPolicy] = policies or dict(DEFAULT_POLICIES)
         # tool_use_id → pending Future + metadata
         self._pending: dict[str, _PendingRequest] = {}
-        # tool_name → "allow"/"deny"：规则文件里已记录的「始终」决策
+        # (session_id, tool_name) → "allow"/"deny"（session 内存，重启丢失）
+        self._session_always: dict[tuple[str, str], str] = {}
+        # tool_name → "allow"/"deny"（规则文件持久化，跨会话生效）
         self._persistent_always: dict[str, str] = (
             load_policy(policy_file) if policy_file else {}
         )
@@ -106,12 +108,16 @@ class PermissionManager:
                     "permission: timeout tool_use_id=%s tool=%s", tool_use_id, tool_name
                 )
                 return False, "timeout"
-            allowed = self._apply_response(raw, tool_name)
+            allowed = self._apply_response(raw, session_id, tool_name)
             return allowed, raw
 
-        # 规则文件里已记录的「始终」决策优先于默认策略
-        cached = self._persistent_always.get(tool_name)
-        if cached:
+        # 缓存层：会话级优先，其次持久化（用户「始终」的选择优先于默认策略）
+        session_key = (session_id, tool_name)
+        if session_key in self._session_always:
+            cached = self._session_always[session_key]
+            return cached == "allow", f"auto_{cached}"
+        if tool_name in self._persistent_always:
+            cached = self._persistent_always[tool_name]
             return cached == "allow", f"auto_{cached}"
 
         # 白名单：命中直接放行
@@ -153,7 +159,7 @@ class PermissionManager:
                 "permission: timeout tool_use_id=%s tool=%s", tool_use_id, tool_name
             )
             return False, "timeout"
-        allowed = self._apply_response(raw, tool_name)
+        allowed = self._apply_response(raw, session_id, tool_name)
         return allowed, raw
 
     # 处理客户端返回的审批决策，resolve 对应 Future
@@ -165,11 +171,13 @@ class PermissionManager:
         if not req.future.done():
             req.future.set_result(decision)
 
-    # 应用审批决策：「始终」决策落盘，返回是否放行
-    def _apply_response(self, decision: str, tool_name: str) -> bool:
+    # 应用审批决策：先记会话内存再回写规则文件；返回是否放行
+    def _apply_response(self, decision: str, session_id: str, tool_name: str) -> bool:
         allow = decision in ("allow_once", "always_allow")
         if decision in ("always_allow", "always_deny"):
-            self._persistent_always[tool_name] = "allow" if allow else "deny"
+            value = "allow" if allow else "deny"
+            self._session_always[(session_id, tool_name)] = value
+            self._persistent_always[tool_name] = value
             if self._policy_file is not None:
                 save_policy_file(self._persistent_always, self._policy_file)
         return allow
