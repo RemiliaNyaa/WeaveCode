@@ -18,12 +18,16 @@ from weavecode.core.bus.events import (
 from weavecode.core.events.bus import EventBus
 from weavecode.core.llm.types import ToolCallBlock
 from weavecode.core.tools.base import ToolResult
+from weavecode.core.tools.errors import RateLimitedError
 from weavecode.core.tools.registry import ToolRegistry
 
 if TYPE_CHECKING:
     from weavecode.core.permissions.manager import PermissionManager
 
 _DEFAULT_TIMEOUT: float = 120.0
+_MAX_RETRIES: int = 2
+_RETRY_BASE_S: float = 2.0  # backoff base; tests can monkeypatch to 0
+_RETRYABLE: frozenset[str] = frozenset({"runtime_error", "rate_limited"})
 
 
 def _now() -> str:
@@ -38,6 +42,8 @@ async def _fail(
     error_class: str,
     error_message: str,
     elapsed_ms: int,
+    *,
+    attempt: int = 1,
 ) -> ToolResult:
     await bus.publish(
         ToolCallFailedEvent(
@@ -47,6 +53,7 @@ async def _fail(
             error_class=error_class,
             error_message=error_message,
             elapsed_ms=elapsed_ms,
+            attempt=attempt,
             ts=_now(),
         )
     )
@@ -64,7 +71,7 @@ def _denial_message(decision: str) -> str:
     )
 
 
-# 校验参数、检查权限、限时调用工具、发布进度事件，失败时转成 ToolResult 回填（不抛异常）
+# 校验参数、检查权限、限时调用工具、发布进度事件，失败时指数退避重试，返回 ToolResult（不抛异常）
 async def invoke_tool(
     registry: ToolRegistry,
     tool_call: ToolCallBlock,
@@ -145,31 +152,69 @@ async def invoke_tool(
                 elapsed(),
             )
 
-    try:
-        result = await asyncio.wait_for(
-            tool.invoke(dict(tool_call.input)), timeout=timeout
-        )
+    for attempt in range(1, _MAX_RETRIES + 2):
+        error_class: str | None = None
+        error_message: str | None = None
+
+        try:
+            result = await asyncio.wait_for(
+                tool.invoke(dict(tool_call.input)), timeout=timeout
+            )
+            ms = elapsed()
+
+            if result.is_error:
+                error_class = result.error_type or "runtime_error"
+                error_message = result.content
+            else:
+                await bus.publish(
+                    ToolCallFinishedEvent(
+                        run_id=run_id,
+                        tool_use_id=tool_call.id,
+                        tool_name=tool_call.name,
+                        elapsed_ms=ms,
+                        output=result.content,
+                        ts=_now(),
+                    )
+                )
+                return result
+
+        except RateLimitedError as exc:
+            error_class = "rate_limited"
+            error_message = str(exc)
+        except TimeoutError:
+            return await _fail(
+                bus, run_id, tool_call,
+                "timeout", f"tool timed out after {timeout}s", elapsed(),
+                attempt=attempt,
+            )
+        except Exception as exc:
+            error_class = "runtime_error"
+            error_message = str(exc)
+
+        assert error_class is not None and error_message is not None
         ms = elapsed()
 
-        if result.is_error:
-            error_class = result.error_type or "runtime_error"
-            return await _fail(bus, run_id, tool_call, error_class, result.content, ms)
-    except TimeoutError:
+        if error_class in _RETRYABLE and attempt <= _MAX_RETRIES:
+            await bus.publish(
+                ToolCallFailedEvent(
+                    run_id=run_id,
+                    tool_use_id=tool_call.id,
+                    tool_name=tool_call.name,
+                    error_class=error_class,
+                    error_message=error_message,
+                    elapsed_ms=ms,
+                    attempt=attempt,
+                    ts=_now(),
+                )
+            )
+            await asyncio.sleep(_RETRY_BASE_S * (2 ** (attempt - 1)))
+            continue
+
         return await _fail(
             bus, run_id, tool_call,
-            "timeout", f"tool timed out after {timeout}s", elapsed(),
+            error_class, error_message, ms,
+            attempt=attempt,
         )
-    except Exception as exc:
-        return await _fail(bus, run_id, tool_call, "runtime_error", str(exc), elapsed())
 
-    await bus.publish(
-        ToolCallFinishedEvent(
-            run_id=run_id,
-            tool_use_id=tool_call.id,
-            tool_name=tool_call.name,
-            elapsed_ms=ms,
-            output=result.content,
-            ts=_now(),
-        )
-    )
-    return result
+    # unreachable, but keeps mypy happy
+    return ToolResult(content="internal error", is_error=True, error_type="runtime_error")
