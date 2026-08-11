@@ -23,6 +23,9 @@ class ExecutionContext:
     prefill_messages: list[dict[str, Any]] = field(default_factory=list)
     # 本会话累积下来的笔记
     session_notes: str = ""
+    # 全局与项目两级背景文件的内容，空段自动跳过
+    global_context: str = ""
+    project_context: str = ""
     messages: list[dict[str, Any]] = field(default_factory=list)
     step: int = 0
     status: str = "running"  # "running" | "success" | "failed"
@@ -36,11 +39,15 @@ class ExecutionContext:
         elif not self.messages:
             self.messages.append({"role": "user", "content": self.goal})
 
-    # 返回本次运行的 system prompt：基础段 + 工具使用说明 + 会话笔记
+    # 返回本次运行的 system prompt：基础段 + 工具使用说明 + 三层上下文
     # 静态文本排在前面、动态内容排在后面，稳定的前缀才能吃到 prompt caching
     def system_prompt(self, base: str) -> str:
         parts = [base]
         parts.append("\n\n" + _TOOL_USAGE)
+        if self.global_context.strip():
+            parts.append("\n\n## Global Context\n" + self.global_context.strip())
+        if self.project_context.strip():
+            parts.append("\n\n## Project Context\n" + self.project_context.strip())
         if self.session_notes.strip():
             parts.append("\n\n## Session Notes\n" + self.session_notes.strip())
         return "".join(parts)
