@@ -9,6 +9,8 @@ from weavecode.core.bus.events import StepFinishedEvent, StepStartedEvent
 from weavecode.core.context import ExecutionContext
 from weavecode.core.events.bus import EventBus
 from weavecode.core.llm.base import LLMProvider
+from weavecode.core.llm.provider import truncate_tool_results
+from weavecode.core.llm.types import UsageStats
 from weavecode.core.tools.invocation import invoke_tool
 from weavecode.core.tools.registry import ToolRegistry
 
@@ -55,6 +57,8 @@ class AgentLoop:
         # 会话标识与权限管理器由 runner 注入，工具调用前先过审批
         self._session_id = session_id
         self._permission_manager = permission_manager
+        # 上一轮请求的用量，水位判据用它来决定要不要压缩
+        self._last_usage: UsageStats | None = None
 
     # 把当前任务状态拼进 system prompt：模型每一步都能看到清单走到哪了
     def _task_section(self, system: str) -> str:
@@ -76,9 +80,11 @@ class AgentLoop:
             )
 
             # think：把当前历史交给 LLM，让它决定下一步做什么
+            # 超长 tool_result 只在这份内存副本里截断，历史原样保留
+            outgoing = truncate_tool_results(list(context.messages))
             try:
                 response = await self._provider.chat(
-                    messages=context.messages,
+                    messages=outgoing,
                     tool_schemas=self._registry.tool_schemas(),
                     bus=self._bus,
                     run_id=context.run_id,
@@ -93,6 +99,16 @@ class AgentLoop:
                 log.exception("LLM call failed run_id=%s step=%d", context.run_id, context.step)
                 context.mark_failed("llm_error")
                 break
+
+            # 记录本轮用量：上下文水位随用量事件下发给客户端，这里留下原始数字供压缩判据使用
+            if response.usage is not None:
+                self._last_usage = response.usage
+                log.debug(
+                    "context usage run_id=%s step=%d input_tokens=%d",
+                    context.run_id,
+                    context.step,
+                    response.usage.input_tokens,
+                )
 
             # observe：响应先进历史，再执行工具——顺序反过来会破坏消息配对
             blocks: list[dict[str, object]] = list(response.thinking_blocks)
@@ -118,6 +134,15 @@ class AgentLoop:
                         self._registry, tc, self._bus, context.run_id, **invoke_extra
                     )
                     context.add_tool_result(tc.id, result.content, is_error=result.is_error)
+            elif response.stop_reason == "max_tokens" and response.tool_calls:
+                # 输出被 token 上限截断，工具调用只有半截：补一条错误结果保持配对完整
+                for tc in response.tool_calls:
+                    context.add_tool_result(
+                        tc.id,
+                        "Error: output token limit reached before this tool call could be "
+                        "completed. Please break the task into smaller steps and try again.",
+                        is_error=True,
+                    )
 
             # 终止检查：模型收工优先于步数上限
             if response.stop_reason == "end_turn":

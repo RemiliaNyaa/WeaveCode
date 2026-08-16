@@ -13,6 +13,10 @@ from weavecode.core.llm.types import LlmResponse, ToolCallBlock, UsageStats
 # 单次请求的输出上限
 _DEFAULT_MAX_TOKENS = 8_192
 
+# tool_result 超过这个字符数就截断，只保留 keep 部分
+TOOL_RESULT_LIMIT = 8_000
+TOOL_RESULT_KEEP = 4_000
+
 _SYSTEM_PROMPT = (
     "You are Weave, an AI assistant running in a terminal. "
     "Use the provided tools to make progress on the user's goal. "
@@ -23,6 +27,41 @@ _SYSTEM_PROMPT = (
 # 返回当前 UTC 时间的 ISO 8601 字符串
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+# 对消息列表里超长的 tool_result 做内存截断，返回新列表，历史原样不动
+def truncate_tool_results(
+    messages: list[dict[str, object]],
+    limit: int = TOOL_RESULT_LIMIT,
+    keep: int = TOOL_RESULT_KEEP,
+) -> list[dict[str, object]]:
+    result: list[dict[str, object]] = []
+    for message in messages:
+        if message.get("role") != "user":
+            result.append(message)
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            result.append(message)
+            continue
+        new_blocks: list[object] = []
+        for block in content:
+            if (
+                isinstance(block, dict)
+                and block.get("type") == "tool_result"
+                and isinstance(block.get("content"), str)
+            ):
+                text = str(block["content"])
+                if len(text) > limit:
+                    omitted = len(text) - keep
+                    block = dict(block)
+                    block["content"] = (
+                        text[:keep]
+                        + f"\n[... {omitted} chars omitted. Full output in run events.]"
+                    )
+            new_blocks.append(block)
+        result.append({**message, "content": new_blocks})
+    return result
 
 
 class AnthropicProvider:
