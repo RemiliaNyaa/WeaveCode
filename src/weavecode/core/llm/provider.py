@@ -8,6 +8,7 @@ import anthropic
 
 from weavecode.core.bus.events import LlmModelSelectedEvent, LlmTokenEvent, LlmUsageEvent
 from weavecode.core.events.bus import EventBus
+from weavecode.core.llm import model_table
 from weavecode.core.llm.types import LlmResponse, ToolCallBlock, UsageStats
 
 # 单次请求的输出上限
@@ -126,6 +127,8 @@ class AnthropicProvider:
         usage = final_message.usage
         cache_read: int = getattr(usage, "cache_read_input_tokens", 0) or 0
         cache_create: int = getattr(usage, "cache_creation_input_tokens", 0) or 0
+        # 上下文水位：本轮输入占模型窗口的比例，随用量事件下发给客户端显示
+        context_pct = usage.input_tokens / model_table.context_window(self._model)
 
         await bus.publish(
             LlmUsageEvent(
@@ -134,6 +137,7 @@ class AnthropicProvider:
                 output_tokens=usage.output_tokens,
                 cache_read_input_tokens=cache_read,
                 cache_creation_input_tokens=cache_create,
+                context_pct=context_pct,
                 ts=_now(),
             )
         )
@@ -161,5 +165,6 @@ class AnthropicProvider:
                 output_tokens=usage.output_tokens,
                 cache_read_input_tokens=cache_read,
                 cache_creation_input_tokens=cache_create,
+                context_pct=context_pct,
             ),
         )

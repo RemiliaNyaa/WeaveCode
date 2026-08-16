@@ -87,6 +87,7 @@ class LlmUsageEvent(BaseModel):
     output_tokens: int
     cache_read_input_tokens: int
     cache_creation_input_tokens: int
+    context_pct: float = 0.0
     ts: str
 
 
