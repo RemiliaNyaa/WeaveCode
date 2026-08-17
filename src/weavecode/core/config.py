@@ -51,6 +51,13 @@ class PermissionConfig:
 
 
 @dataclass
+class CompactionConfig:
+    auto_threshold: float = 0.8     # 上下文水位达到该比例才触发压缩（0 表示关闭）
+    tool_result_limit: int = 8_000  # tool_result 截断触发字符数
+    tool_result_keep: int = 4_000   # 截断后保留的前缀字符数
+
+
+@dataclass
 class WeaveConfig:
     host: str = _DEFAULT_HOST
     port: int = _DEFAULT_PORT
@@ -59,6 +66,7 @@ class WeaveConfig:
     llm: LlmConfig = field(default_factory=LlmConfig)
     trace: TraceConfig = field(default_factory=TraceConfig)
     permission: PermissionConfig = field(default_factory=PermissionConfig)
+    compaction: CompactionConfig = field(default_factory=CompactionConfig)
 
 
 # 构建并返回运行时配置：默认值 → TOML → .env → WEAVE_* 环境变量（后者优先级最高）
@@ -201,6 +209,17 @@ def _apply_toml(config: WeaveConfig, data: dict[str, Any]) -> None:
     if persist is not None:
         config.permission.persist = persist
 
+    comp = _section(data, "compaction")
+    threshold = _read_float(comp, "auto_threshold", "compaction.auto_threshold")
+    if threshold is not None:
+        config.compaction.auto_threshold = threshold
+    tool_limit = _read_int(comp, "tool_result_limit", "compaction.tool_result_limit")
+    if tool_limit is not None:
+        config.compaction.tool_result_limit = tool_limit
+    tool_keep = _read_int(comp, "tool_result_keep", "compaction.tool_result_keep")
+    if tool_keep is not None:
+        config.compaction.tool_result_keep = tool_keep
+
 
 # 用 WEAVE_* 环境变量覆盖 config 中对应字段（若变量已设置）
 def _apply_env(config: WeaveConfig) -> None:
@@ -281,4 +300,48 @@ def _apply_env(config: WeaveConfig) -> None:
         else:
             raise SystemExit(
                 f"Config error: WEAVE_PERMISSION_PERSIST must be a boolean, got: {perm_persist!r}"
+            )
+
+    compact_threshold = os.environ.get("WEAVE_COMPACT_THRESHOLD")
+    if compact_threshold is not None:
+        try:
+            compact_threshold_val = float(compact_threshold)
+            if compact_threshold_val < 0 or compact_threshold_val > 1:
+                raise SystemExit(
+                    "Config error: WEAVE_COMPACT_THRESHOLD must be within 0~1,"
+                    f" got: {compact_threshold!r}"
+                )
+            config.compaction.auto_threshold = compact_threshold_val
+        except ValueError:
+            raise SystemExit(
+                "Config error: WEAVE_COMPACT_THRESHOLD must be a number, "
+                f"got: {compact_threshold!r}"
+            )
+
+    compact_tool_limit = os.environ.get("WEAVE_COMPACT_TOOL_LIMIT")
+    if compact_tool_limit is not None:
+        try:
+            compact_tool_limit_val = int(compact_tool_limit)
+            if compact_tool_limit_val <= 0:
+                raise SystemExit(
+                    f"Config error: WEAVE_COMPACT_TOOL_LIMIT must be a positive integer, got: {compact_tool_limit!r}"
+                )
+            config.compaction.tool_result_limit = compact_tool_limit_val
+        except ValueError:
+            raise SystemExit(
+                f"Config error: WEAVE_COMPACT_TOOL_LIMIT must be an integer, got: {compact_tool_limit!r}"
+            )
+
+    compact_tool_keep = os.environ.get("WEAVE_COMPACT_TOOL_KEEP")
+    if compact_tool_keep is not None:
+        try:
+            compact_tool_keep_val = int(compact_tool_keep)
+            if compact_tool_keep_val <= 0:
+                raise SystemExit(
+                    f"Config error: WEAVE_COMPACT_TOOL_KEEP must be a positive integer, got: {compact_tool_keep!r}"
+                )
+            config.compaction.tool_result_keep = compact_tool_keep_val
+        except ValueError:
+            raise SystemExit(
+                f"Config error: WEAVE_COMPACT_TOOL_KEEP must be an integer, got: {compact_tool_keep!r}"
             )
