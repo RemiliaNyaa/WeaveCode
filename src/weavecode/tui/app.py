@@ -410,6 +410,7 @@ class WeaveTuiApp(App[None]):
         self._client: SocketClient | None = None
         self._session_id: str | None = None
         self._busy = False
+        self._last_context_pct: float = 0.0
         self._current_llm: LLMStreamBlock | None = None
         self._pending_tool_blocks: dict[str, ToolCallBlock] = {}
         self._pending_permission_blocks: dict[str, PermissionBlock] = {}
@@ -463,6 +464,19 @@ class WeaveTuiApp(App[None]):
             f"[bold]WeaveCode[/bold]  [dim]{self._host}:{self._port}[/dim]{session}"
             f"  [{color}]{state}[/{color}]"
         )
+
+    # 生成 context 占用率的彩色进度条：70% 变黄、85% 变红
+    def _render_ctx_bar(self, pct: float) -> str:
+        filled = int(pct * 20)
+        bar = "█" * filled + "░" * (20 - filled)
+        label = f"ctx:{pct * 100:.1f}%"
+        if pct >= 0.85:
+            color = "bold red"
+        elif pct >= 0.70:
+            color = "yellow"
+        else:
+            color = "dim"
+        return f"[{color}]{label} {bar}[/{color}]"
 
     # 惰性挂出任务列表，后续任务事件都更新这一块
     def _tasks(self) -> TaskListBlock:
@@ -811,9 +825,14 @@ class WeaveTuiApp(App[None]):
                 tc_done.set_result(error_msg, elapsed_ms, is_error=True)
 
         elif t == "llm.usage":
+            pct = float(event.get("context_pct") or 0.0)
+            # 每次用量都取当次上报的水位，压缩之后下一次上报自然回落
+            self._last_context_pct = pct
+            ctx_bar = self._render_ctx_bar(pct)
             self._append(Static(
                 f"[dim]  tokens  in={event.get('input_tokens')}"
                 f" out={event.get('output_tokens')}"
-                f" cache={event.get('cache_read_input_tokens')}[/dim]",
+                f" cache={event.get('cache_read_input_tokens')}[/dim]"
+                f"  {ctx_bar}",
                 classes="usage",
             ))
