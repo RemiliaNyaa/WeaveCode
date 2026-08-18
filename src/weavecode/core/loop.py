@@ -15,6 +15,7 @@ from weavecode.core.tools.invocation import invoke_tool
 from weavecode.core.tools.registry import ToolRegistry
 
 if TYPE_CHECKING:
+    from weavecode.core.compact.compactor import Compactor
     from weavecode.core.task import TaskManager
 
 log = logging.getLogger(__name__)
@@ -32,6 +33,9 @@ _SYSTEM_PROMPT = (
 #   LLM 调用抛错 / 被 Ctrl+C 取消 → failed: llm_error / cancelled
 # 工具执行出错不终止：错误作为结果回填，让模型自己换方案
 
+# 上下文水位达到这个比例就触发自动压缩
+_AUTO_COMPACT_THRESHOLD = 0.8
+
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
@@ -48,6 +52,7 @@ class AgentLoop:
         tasks: TaskManager | None = None,
         session_id: str = "",
         permission_manager: Any = None,
+        compactor: Compactor | None = None,
     ) -> None:
         self._provider = provider
         self._registry = registry
@@ -57,6 +62,8 @@ class AgentLoop:
         # 会话标识与权限管理器由 runner 注入，工具调用前先过审批
         self._session_id = session_id
         self._permission_manager = permission_manager
+        # 压缩器注入后水位到线才可能触发压缩；没有压缩器时循环照常跑
+        self._compactor = compactor
         # 上一轮请求的用量，水位判据用它来决定要不要压缩
         self._last_usage: UsageStats | None = None
 
@@ -150,6 +157,17 @@ class AgentLoop:
                 context.mark_success()
             elif context.step >= context.max_steps and not context.is_done():
                 context.mark_failed("exceeded_max_steps")
+
+            # 水位到线就自动压缩（收到响应之后判一次）；手动 /compact 走同一个 Compactor 入口
+            if (
+                self._compactor is not None
+                and not context.is_done()
+                and self._last_usage is not None
+                and self._last_usage.context_pct >= _AUTO_COMPACT_THRESHOLD
+            ):
+                await self._compactor.compact(context, self._provider)
+                self._last_usage = None
+                log.info("context compacted run_id=%s step=%d", context.run_id, context.step)
 
             await self._bus.publish(
                 StepFinishedEvent(run_id=context.run_id, step=context.step, ts=_now())

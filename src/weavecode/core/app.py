@@ -25,6 +25,8 @@ from weavecode.core.bus.commands import (
     PongResult,
     SessionCloseCommand,
     SessionCloseResult,
+    SessionCompactCommand,
+    SessionCompactResult,
     SessionCreateCommand,
     SessionCreateResult,
     SessionGetHistoryCommand,
@@ -35,6 +37,7 @@ from weavecode.core.bus.commands import (
 from weavecode.core.bus.envelope import EventPushEnvelope
 from weavecode.core.config import WeaveConfig, get_config
 from weavecode.core.events.bus import EventBus
+from weavecode.core.llm.provider import AnthropicProvider
 from weavecode.core.logging_setup import setup_logging
 from weavecode.core.permissions.manager import PermissionManager
 from weavecode.core.runner import AgentRunner
@@ -135,6 +138,13 @@ class CoreApp:
         self._permission_manager.respond(cmd.tool_use_id, cmd.decision)
         return PermissionRespondResult()
 
+    # 手动压缩 session thread，将摘要持久化写入 thread.jsonl
+    async def _session_compact_handler(self, params: dict[str, Any]) -> SessionCompactResult:
+        assert self._sessions is not None
+        cmd = SessionCompactCommand.model_validate(params)
+        result = await self._sessions.compact(cmd.session_id, cmd.focus)
+        return result  # type: ignore[no-any-return]
+
     # 关闭 session 并返回 closed 状态
     async def _session_close_handler(self, params: dict[str, Any]) -> SessionCloseResult:
         assert self._sessions is not None
@@ -218,6 +228,10 @@ class CoreApp:
         )
 
         store = SessionStore()
+
+        assert self._config is not None
+        compact_provider = AnthropicProvider(self._config.llm.default_model)
+
         self._sessions = SessionManager(
             store,
             runner_factory=lambda: AgentRunner(
@@ -227,6 +241,8 @@ class CoreApp:
                 permission_manager=self._permission_manager,
             ),
             bus=self._bus,
+            provider=compact_provider,
+            compaction_keep_tokens=self._config.compaction.keep_tokens,
         )
 
         server = SocketServer(
@@ -243,6 +259,7 @@ class CoreApp:
         server.register("session.get_history", self._session_history_handler)
         server.register("session.close", self._session_close_handler)
         server.register("permission.respond", self._permission_respond_handler)
+        server.register("session.compact", self._session_compact_handler)
 
         addr = await server.start()
         logger.info("weave-core %s listening addr=%s", weavecode.__version__, addr)
