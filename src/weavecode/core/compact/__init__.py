@@ -1,3 +1,4 @@
-from weavecode.core.compact.budget import budget_from_watermark, truncate_tool_results
+from weavecode.core.compact.budget import truncate_tool_results
+from weavecode.core.compact.compactor import CompactionResult, Compactor
 
-__all__ = ["budget_from_watermark", "truncate_tool_results"]
+__all__ = ["Compactor", "CompactionResult", "truncate_tool_results"]
