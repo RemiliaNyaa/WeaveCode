@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from pathlib import Path
 from typing import Any
 
 from weavecode.core.config import WeaveConfig
@@ -26,7 +27,7 @@ class ChatPrinter:
             print()
             self._inline = False
 
-    # 按事件类型打印 chat 输出、流式回复和权限审批请求
+    # 按事件类型打印 chat 输出、等待提示和权限审批请求
     async def handle(self, event: dict[str, Any]) -> None:
         t = event.get("type", "")
         if t == "llm.token":
@@ -43,6 +44,13 @@ class ChatPrinter:
             print(f"[permission] {tool_name}  {param_preview}")
             print("  y=allow once  a=always allow  n=reject")
             self.pending_permission_id = tool_use_id
+        elif t == "session.waiting_for_input":
+            self._ensure_newline()
+            self.pending_permission_id = None
+            print("[waiting for input]")
+        elif t == "session.closed":
+            self._ensure_newline()
+            print("session closed.")
 
 
 # 在线程池中读取 stdin，避免阻塞 socket event loop
@@ -72,7 +80,9 @@ async def _chat_async(config: WeaveConfig) -> int:
                 "scope": "global",
             },
         )
-        created = await client.send_command("session.create", {"mode": "chat"})
+        created = await client.send_command(
+            "session.create", {"mode": "chat", "cwd": str(Path.cwd())}
+        )
         session_id = str(created["session_id"])
         print(f"[session: {session_id}]")
 
@@ -100,7 +110,8 @@ async def _chat_async(config: WeaveConfig) -> int:
                 continue
 
             await client.send_command(
-                "session.send_message", {"session_id": session_id, "content": content}
+                "session.send_message",
+                {"session_id": session_id, "content": content},
             )
 
         await client.send_command("session.close", {"session_id": session_id})

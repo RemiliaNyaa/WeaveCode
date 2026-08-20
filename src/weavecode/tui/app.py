@@ -12,10 +12,12 @@ from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import VerticalScroll
+from textual.css.query import NoMatches
 from textual.message import Message
 from textual.widget import Widget
 from textual.widgets import Label, Static, TextArea
 
+from weavecode.core.skills.loader import SkillLoader
 from weavecode.core.transport.socket_client import IpcError, SocketClient
 
 # 输入框解锁后的边框标题
@@ -329,6 +331,82 @@ class PermissionBlock(Static):
         self.post_message(self.Resolved(self, decision))
 
 
+class SlashCompleteWidget(Static):
+    """斜杠命令自动补全弹出框：输入 / 时显示可用 skill 列表并支持键盘筛选与选择。"""
+
+    can_focus = False
+
+    DEFAULT_CSS = """
+    SlashCompleteWidget {
+        height: auto;
+        padding: 0 1;
+        margin: 0 2;
+        background: $surface;
+        border: round $surface-lighten-2;
+    }
+    """
+
+    # 用户选中某条命令时发布
+    class Selected(Message):
+        def __init__(self, skill_name: str) -> None:
+            self.skill_name = skill_name
+            super().__init__()
+
+    # 初始化，接收全量 (name, description) 列表
+    def __init__(self, items: list[tuple[str, str]]) -> None:
+        super().__init__("")
+        self._all_items = items
+        self._filtered: list[tuple[str, str]] = list(items)
+        self._cursor = 0
+
+    # 根据查询字符串筛选列表，重置光标并重新渲染
+    def set_query(self, query: str) -> None:
+        q = query.lower()
+        self._filtered = [(n, d) for n, d in self._all_items if not q or q in n.lower()]
+        self._cursor = min(self._cursor, max(0, len(self._filtered) - 1))
+        if self.is_attached:
+            self._redraw()
+
+    # 向上移动光标并重新渲染
+    def move_up(self) -> None:
+        if self._filtered:
+            self._cursor = (self._cursor - 1) % len(self._filtered)
+            self._redraw()
+
+    # 向下移动光标并重新渲染
+    def move_down(self) -> None:
+        if self._filtered:
+            self._cursor = (self._cursor + 1) % len(self._filtered)
+            self._redraw()
+
+    # 选中当前光标项并发布 Selected 消息
+    def select_current(self) -> None:
+        if self._filtered:
+            self.post_message(self.Selected(self._filtered[self._cursor][0]))
+
+    # 返回当前是否有可选项
+    def has_selection(self) -> bool:
+        return len(self._filtered) > 0
+
+    def on_mount(self) -> None:
+        self._redraw()
+
+    # 渲染筛选后的命令列表，高亮当前光标项
+    def _redraw(self) -> None:
+        if not self._filtered:
+            self.update("[dim]  no matching commands[/dim]")
+            return
+        lines: list[str] = []
+        for i, (name, desc) in enumerate(self._filtered):
+            desc_part = f"  [dim]{desc}[/dim]" if desc else ""
+            if i == self._cursor:
+                lines.append(f"  [bold cyan]❯ /{name}[/bold cyan]{desc_part}")
+            else:
+                lines.append(f"    [cyan]/{name}[/cyan]{desc_part}")
+        lines.append("[dim]  ↑↓ navigate   tab/enter select   esc dismiss[/dim]")
+        self.update("\n".join(lines))
+
+
 class ChatTextArea(TextArea):
     """支持 Enter 提交、Cmd/Shift/Alt+Enter 换行的多行聊天输入框。"""
 
@@ -356,12 +434,36 @@ class ChatTextArea(TextArea):
             self.value = area.text
             super().__init__()
 
-    # Enter 提交；Cmd/Shift/Alt+Enter 插入换行；其余键交回 TextArea
+    # 输入内容以 / 开头且无空格时发布，query 为 / 之后的字符串；None 表示收起弹窗
+    class SlashChanged(Message):
+        def __init__(self, query: str | None) -> None:
+            self.query = query
+            super().__init__()
+
+    # 文本变化时检测 / 前缀，通知宿主 App 更新自动补全弹窗
+    def on_text_area_changed(self, event: TextArea.Changed) -> None:
+        text = self.text
+        if text.startswith("/") and " " not in text:
+            self.post_message(ChatTextArea.SlashChanged(query=text[1:]))
+        else:
+            self.post_message(ChatTextArea.SlashChanged(query=None))
+
+    # Enter 提交；↑↓/Tab/Esc 路由到自动补全弹窗；Cmd/Shift/Alt+Enter 插入换行
     async def _on_key(self, event: events.Key) -> None:
         key = event.key
+
+        popup: SlashCompleteWidget | None = None
+        try:
+            popup = self.app.query_one(SlashCompleteWidget)
+        except NoMatches:
+            popup = None
+
         if key == "enter":
             event.stop()
             event.prevent_default()
+            if popup is not None and popup.has_selection():
+                popup.select_current()
+                return
             if self.text.strip():
                 self.post_message(self.Submitted(self))
             return
@@ -371,6 +473,27 @@ class ChatTextArea(TextArea):
             if not self.read_only:
                 self.insert("\n")
             return
+        if popup is not None:
+            if key == "up":
+                event.stop()
+                event.prevent_default()
+                popup.move_up()
+                return
+            elif key == "down":
+                event.stop()
+                event.prevent_default()
+                popup.move_down()
+                return
+            elif key == "tab":
+                event.stop()
+                event.prevent_default()
+                popup.select_current()
+                return
+            elif key == "escape":
+                event.stop()
+                event.prevent_default()
+                self.post_message(ChatTextArea.SlashChanged(query=None))
+                return
         await super()._on_key(event)
 
 
@@ -415,18 +538,36 @@ class WeaveTuiApp(App[None]):
         self._pending_tool_blocks: dict[str, ToolCallBlock] = {}
         self._pending_permission_blocks: dict[str, PermissionBlock] = {}
         self._task_list: TaskListBlock | None = None
+        self._slash_items: list[tuple[str, str]] = []
 
     def compose(self) -> ComposeResult:
         yield Label("[bold]WeaveCode[/bold]  [dim]connecting...[/dim]", id="header")
         yield VerticalScroll(id="log-view")
         yield ChatTextArea(id="prompt", show_line_numbers=False)
 
-    # 挂载后锁住输入框并启动连接守护进程的 worker
+    # 挂载后构建斜杠命令候选、锁住输入框并启动连接 worker
     def on_mount(self) -> None:
+        self._slash_items = self._build_slash_items()
         self.run_worker(self._socket_loop(), exclusive=True, name="socket")
         prompt = self.query_one("#prompt", ChatTextArea)
         prompt.disabled = True
         prompt.border_title = "connecting..."
+
+    # 构建斜杠命令候选列表：内建命令 + 所有已注册 skill
+    def _build_slash_items(self) -> list[tuple[str, str]]:
+        items: list[tuple[str, str]] = [
+            ("compact", "compress context window"),
+        ]
+        try:
+            loader = SkillLoader()
+            for skill in loader.list_all_skills():
+                desc = skill.description.splitlines()[0] if skill.description else ""
+                if len(desc) > 60:
+                    desc = desc[:57] + "..."
+                items.append((skill.name, desc))
+        except Exception:
+            pass
+        return items
 
     # 安全获取输入框，组件测试里未挂载时跳过 UI 操作
     def _prompt(self) -> ChatTextArea | None:
@@ -567,10 +708,44 @@ class WeaveTuiApp(App[None]):
                 self._append(Static("[yellow]warning: failed to close session[/yellow]"))
         self.exit()
 
+    # 根据 / 前缀查询字符串挂载、更新或移除自动补全弹窗
+    def on_chat_text_area_slash_changed(self, event: ChatTextArea.SlashChanged) -> None:
+        query = event.query
+        if query is None:
+            try:
+                self.query_one(SlashCompleteWidget).remove()
+            except NoMatches:
+                pass
+            return
+        try:
+            popup = self.query_one(SlashCompleteWidget)
+            popup.set_query(query)
+        except NoMatches:
+            popup = SlashCompleteWidget(self._slash_items)
+            self.mount(popup, before="#prompt")
+            popup.set_query(query)
+
+    # 用户选中自动补全项后把 /{name} 填入输入框并移除弹窗
+    def on_slash_complete_widget_selected(self, event: SlashCompleteWidget.Selected) -> None:
+        prompt = self._prompt()
+        if prompt is not None:
+            prompt.text = f"/{event.skill_name} "
+            prompt.move_cursor(prompt.document.end)
+        try:
+            self.query_one(SlashCompleteWidget).remove()
+        except NoMatches:
+            pass
+
     # 输入框提交：锁定输入、回显用户回合，再交给 worker 发送
     async def on_chat_text_area_submitted(self, event: ChatTextArea.Submitted) -> None:
         content = event.value.strip()
         if not content:
+            return
+        # 检测 /compact 指令
+        if content == "/compact":
+            event.text_area.text = ""
+            if self._client is not None and self._session_id is not None and not self._busy:
+                self.run_worker(self._do_compact(), name="compact", exclusive=False)
             return
         if self._client is None or self._session_id is None or self._busy:
             self._append(Static("[yellow]agent busy or disconnected[/yellow]", classes="log-line"))
@@ -603,6 +778,27 @@ class WeaveTuiApp(App[None]):
                 prompt.border_title = _PROMPT_HINT
             self._update_header("ready")
             self._append(Static(f"[red]send error: {e}[/red]", classes="log-line"))
+
+    # 在 worker 中执行手动压缩命令，完成后显示结果横幅
+    async def _do_compact(self) -> None:
+        if self._client is None or self._session_id is None:
+            return
+        self._append(Static("[dim]compacting context...[/dim]", classes="log-line"))
+        try:
+            result = await self._client.send_command(
+                "session.compact",
+                {"session_id": self._session_id, "focus": ""},
+            )
+            summary_tokens = result.get("summary_tokens", 0)
+            saved_tokens = result.get("saved_tokens", 0)
+            self._last_context_pct = 0.0
+            self._append(Static(
+                f"[bold cyan]Context compacted[/bold cyan]"
+                f"  [dim]summary={summary_tokens} tokens  saved≈{saved_tokens} tokens[/dim]",
+                classes="log-line",
+            ))
+        except (IpcError, RuntimeError, OSError) as e:
+            self._append(Static(f"[red]compact error: {e}[/red]", classes="log-line"))
 
     # 管理 SocketClient 生命周期：连接、订阅事件、创建会话、断线重连
     async def _socket_loop(self) -> None:
@@ -637,6 +833,8 @@ class WeaveTuiApp(App[None]):
                         "llm.token",
                         "llm.usage",
                         "permission.*",
+                        "context.*",
+                        "skill.*",
                     ],
                     "scope": "global",
                 }
@@ -768,6 +966,16 @@ class WeaveTuiApp(App[None]):
                     pass
                 self._unlock_prompt()
 
+        elif t == "skill.invoked":
+            skill_name = event.get("skill_name", "")
+            arguments = event.get("arguments", "")
+            args_preview = _preview(arguments, 80) if arguments else ""
+            args_part = f"  [dim]{args_preview}[/dim]" if args_preview else ""
+            self._append(Static(
+                f"[bold cyan]/{skill_name}[/bold cyan]{args_part}",
+                classes="log-line",
+            ))
+
         elif t == "run.started":
             run_id = event.get("run_id", "")
             goal = event.get("goal", "")
@@ -835,4 +1043,14 @@ class WeaveTuiApp(App[None]):
                 f" cache={event.get('cache_read_input_tokens')}[/dim]"
                 f"  {ctx_bar}",
                 classes="usage",
+            ))
+
+        elif t == "context.compacted":
+            orig = event.get("original_tokens", 0)
+            summary = event.get("summary_tokens", 0)
+            self._last_context_pct = 0.0
+            self._append(Static(
+                f"[bold cyan]Context compacted[/bold cyan]"
+                f"  [dim]original≈{orig} tokens → summary={summary} tokens[/dim]",
+                classes="log-line",
             ))

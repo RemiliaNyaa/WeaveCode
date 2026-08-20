@@ -13,11 +13,13 @@ from weavecode.core.bus.events import (
     SessionMessageReceivedEvent,
     SessionResumedEvent,
     SessionWaitingForInputEvent,
+    SkillInvokedEvent,
 )
 from weavecode.core.events.bus import EventBus
 from weavecode.core.runs import new_run_id
 from weavecode.core.session.model import Session, SessionMode
 from weavecode.core.session.store import SessionStore
+from weavecode.core.skills.loader import SkillLoader
 
 if TYPE_CHECKING:
     from weavecode.core.llm.base import LLMProvider
@@ -82,16 +84,40 @@ class SessionManager:
             if session.status == "waiting_for_input":
                 await self._bus.publish(SessionResumedEvent(session_id=sid, ts=_now()))
 
-            # 用户消息必须先写进 thread，再交给 runner 回放
-            self._store.append_message(sid, "user", content)
-            await self._bus.publish(
-                SessionMessageReceivedEvent(session_id=sid, content=content, ts=_now())
-            )
-
             run_id = run_id or new_run_id()
             session.run_ids.append(run_id)
             session.updated_at = _now()
             self._store.write_meta(session)
+
+            # Skill 解析：检测 "/" 前缀。命中时存一条指令消息并发布 skill 调用事件，
+            # 未命中则存原始消息，按普通对话继续。
+            skill = None
+            arguments = ""
+            if content.startswith("/"):
+                parts = content[1:].split(None, 1)
+                skill_name = parts[0]
+                arguments = parts[1] if len(parts) > 1 else ""
+                skill = SkillLoader().resolve(skill_name)
+                if skill is not None:
+                    instruction = skill.user_prompt(arguments)
+                    if skill.allowed_tools:
+                        instruction += "\n\n可用工具：" + ", ".join(skill.allowed_tools)
+                    self._store.append_message(sid, "user", instruction)
+                    await self._bus.publish(
+                        SkillInvokedEvent(
+                            skill_name=skill_name,
+                            arguments=arguments,
+                            run_id=run_id,
+                            ts=_now(),
+                        )
+                    )
+                else:
+                    self._store.append_message(sid, "user", content)
+            else:
+                self._store.append_message(sid, "user", content)
+            await self._bus.publish(
+                SessionMessageReceivedEvent(session_id=sid, content=content, ts=_now())
+            )
 
             if not session.title:
                 session.title = content[:40]

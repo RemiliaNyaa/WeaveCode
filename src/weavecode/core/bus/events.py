@@ -179,6 +179,14 @@ class PermissionDeniedEvent(BaseModel):
     ts: str
 
 
+class SkillInvokedEvent(BaseModel):
+    type: Literal["skill.invoked"] = "skill.invoked"
+    skill_name: str
+    arguments: str
+    run_id: str
+    ts: str
+
+
 # 根据 type 字段决定事件类型的判别联合
 Event = Annotated[
     CoreStartedEvent
@@ -201,6 +209,7 @@ Event = Annotated[
     | ContextCompactedEvent
     | PermissionRequestedEvent
     | PermissionGrantedEvent
-    | PermissionDeniedEvent,
+    | PermissionDeniedEvent
+    | SkillInvokedEvent,
     Discriminator("type"),
 ]
