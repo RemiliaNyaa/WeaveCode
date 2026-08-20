@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from weavecode.core.skills.loader import SkillLoader
+
 # 工具使用说明：静态文本，拼在基础段之后一起构成可缓存的前缀
 _TOOL_USAGE = (
     "## Tools\n"
@@ -39,7 +41,7 @@ class ExecutionContext:
         elif not self.messages:
             self.messages.append({"role": "user", "content": self.goal})
 
-    # 返回本次运行的 system prompt：基础段 + 工具使用说明 + 三层上下文
+    # 返回本次运行的 system prompt：基础段 + 工具使用说明 + 三层上下文 + 技能清单
     # 静态文本排在前面、动态内容排在后面，稳定的前缀才能吃到 prompt caching
     def system_prompt(self, base: str) -> str:
         parts = [base]
@@ -50,6 +52,7 @@ class ExecutionContext:
             parts.append("\n\n## Project Context\n" + self.project_context.strip())
         if self.session_notes.strip():
             parts.append("\n\n## Session Notes\n" + self.session_notes.strip())
+        parts.append("\n\n## Skills\n" + SkillLoader().render_catalog())
         return "".join(parts)
 
     # 将 LLM 响应的 content blocks 追加为 assistant 消息
