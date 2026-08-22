@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel
 
+from weavecode.core.bus.events import SubagentFinishedEvent, SubagentStartedEvent
 from weavecode.core.context import ExecutionContext
 from weavecode.core.events.bus import EventBus
+from weavecode.core.events.writer import EventWriter
 from weavecode.core.loop import AgentLoop
 from weavecode.core.runs import new_run_id
 from weavecode.core.subagent.registry import AgentResultTool, BackgroundTaskRegistry
@@ -17,6 +21,10 @@ from weavecode.core.tools.registry import ToolRegistry
 if TYPE_CHECKING:
     from weavecode.core.llm.base import LLMProvider
     from weavecode.core.permissions.manager import PermissionManager
+
+
+def _now() -> str:
+    return datetime.now(UTC).isoformat()
 
 
 class SpawnAgentParams(BaseModel):
@@ -87,16 +95,22 @@ class SpawnAgentTool(BaseTool):
     def __init__(
         self,
         provider: LLMProvider,
+        parent_bus: EventBus,
+        parent_run_id: str,
         permission_manager: PermissionManager | None,
         max_steps: int,
         session_id: str,
+        runs_dir: Path,
         task_registry: BackgroundTaskRegistry,
         depth: int = 0,
     ) -> None:
         self._provider = provider
+        self._parent_bus = parent_bus
+        self._parent_run_id = parent_run_id
         self._permission_manager = permission_manager
         self._max_steps = max_steps
         self._session_id = session_id
+        self._runs_dir = runs_dir
         self._task_registry = task_registry
         self._depth = depth
 
@@ -115,7 +129,7 @@ class SpawnAgentTool(BaseTool):
             max_steps=self._max_steps,
         )
         if p.run_in_background:
-            task = asyncio.create_task(self._run_child(child_context, p))
+            task = asyncio.create_task(self._run_child(child_run_id, child_context, p))
             self._task_registry.register(child_run_id, task, child_context)
             return ToolResult(
                 content=(
@@ -123,11 +137,20 @@ class SpawnAgentTool(BaseTool):
                     f"Use agent_result(run_id='{child_run_id}') to retrieve result."
                 )
             )
-        return await self._run_child(child_context, p)
+        return await self._run_child(child_run_id, child_context, p)
 
-    # 跑一个子 Agent：冷启动上下文 + 全新事件总线，返回它的结果
-    async def _run_child(self, child_context: ExecutionContext, p: SpawnAgentParams) -> ToolResult:
+    # 跑一个子 Agent：冷启动上下文 + 事件桥接 + 写事件文件，返回它的结果
+    async def _run_child(
+        self, child_run_id: str, child_context: ExecutionContext, p: SpawnAgentParams
+    ) -> ToolResult:
         child_bus = EventBus()
+
+        # 将子 bus 所有事件桥接到父 bus，TUI 据此渲染嵌套进度
+        async def _bridge(event: BaseModel) -> None:
+            await self._parent_bus.publish(event)
+
+        child_bus.subscribe(_bridge)
+
         child_registry = self._build_child_registry()
         child_loop = AgentLoop(
             self._provider,
@@ -136,7 +159,26 @@ class SpawnAgentTool(BaseTool):
             permission_manager=self._permission_manager,
             session_id=self._session_id,
         )
-        await child_loop.run(child_context)
+
+        await self._parent_bus.publish(
+            SubagentStartedEvent(
+                run_id=child_run_id,
+                parent_run_id=self._parent_run_id,
+                ts=_now(),
+            )
+        )
+
+        async with EventWriter(self._runs_dir / child_run_id / "events.jsonl") as writer:
+            writer.subscribe(child_bus)
+            await child_loop.run(child_context)
+
+        await self._parent_bus.publish(
+            SubagentFinishedEvent(
+                run_id=child_run_id,
+                parent_run_id=self._parent_run_id,
+                ts=_now(),
+            )
+        )
 
         if child_context.status == "success":
             return ToolResult(
@@ -159,9 +201,12 @@ class SpawnAgentTool(BaseTool):
         registry.register(
             SpawnAgentTool(
                 provider=self._provider,
+                parent_bus=self._parent_bus,
+                parent_run_id=self._parent_run_id,
                 permission_manager=self._permission_manager,
                 max_steps=self._max_steps,
                 session_id=self._session_id,
+                runs_dir=self._runs_dir,
                 task_registry=self._task_registry,
                 depth=self._depth + 1,
             )

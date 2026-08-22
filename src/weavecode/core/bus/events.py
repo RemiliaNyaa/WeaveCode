@@ -179,6 +179,20 @@ class PermissionDeniedEvent(BaseModel):
     ts: str
 
 
+class SubagentStartedEvent(BaseModel):
+    type: Literal["subagent.started"] = "subagent.started"
+    run_id: str          # 子 agent run_id
+    parent_run_id: str
+    ts: str
+
+
+class SubagentFinishedEvent(BaseModel):
+    type: Literal["subagent.finished"] = "subagent.finished"
+    run_id: str
+    parent_run_id: str
+    ts: str
+
+
 class SkillInvokedEvent(BaseModel):
     type: Literal["skill.invoked"] = "skill.invoked"
     skill_name: str
@@ -210,6 +224,8 @@ Event = Annotated[
     | PermissionRequestedEvent
     | PermissionGrantedEvent
     | PermissionDeniedEvent
+    | SubagentStartedEvent
+    | SubagentFinishedEvent
     | SkillInvokedEvent,
     Discriminator("type"),
 ]

@@ -539,6 +539,9 @@ class WeaveTuiApp(App[None]):
         self._pending_permission_blocks: dict[str, PermissionBlock] = {}
         self._task_list: TaskListBlock | None = None
         self._slash_items: list[tuple[str, str]] = []
+        self._subagent_run_ids: dict[str, str] = {}  # child run_id -> description（运行中）
+        self._subagent_done: list[tuple[str, str]] = []  # (description, status) 本轮已结束的
+        self._header_state = "connecting"  # 最近一次 header 状态，供子 Agent 事件刷新时复用
 
     def compose(self) -> ComposeResult:
         yield Label("[bold]WeaveCode[/bold]  [dim]connecting...[/dim]", id="header")
@@ -588,12 +591,13 @@ class WeaveTuiApp(App[None]):
             self._current_llm.finalize_markdown()
             self._current_llm = None
 
-    # 根据连接与运行状态刷新顶部状态栏
+    # 根据连接与运行状态刷新顶部状态栏（尾部附带子 Agent 实时进度）
     def _update_header(self, state: str) -> None:
         try:
             header = self.query_one("#header", Label)
         except Exception:
             return
+        self._header_state = state
         color = {
             "ready": "green",
             "running": "yellow",
@@ -603,7 +607,24 @@ class WeaveTuiApp(App[None]):
         session = f"  [dim]{self._session_id}[/dim]" if self._session_id else ""
         header.update(
             f"[bold]WeaveCode[/bold]  [dim]{self._host}:{self._port}[/dim]{session}"
-            f"  [{color}]{state}[/{color}]"
+            f"  [{color}]{state}[/{color}]{self._subagent_segment()}"
+        )
+
+    # 渲染顶部标题里的子 Agent 段：│ 子 Agent 1/3  ✓ 研究A   ⏳ 研究B
+    def _subagent_segment(self) -> str:
+        done = len(self._subagent_done)
+        running = len(self._subagent_run_ids)
+        if done == 0 and running == 0:
+            return ""
+        marks = [
+            ("[bold green]✓[/bold green]" if status == "success" else "[bold red]✗[/bold red]",
+             desc)
+            for desc, status in self._subagent_done
+        ]
+        marks += [("[yellow]⏳[/yellow]", desc) for desc in self._subagent_run_ids.values()]
+        detail = "   ".join(f"{mark} {_preview(desc, 32)}" for mark, desc in marks)
+        return (
+            f"  [dim]│[/dim] [yellow]子 Agent {done}/{done + running}[/yellow]  {detail}"
         )
 
     # 生成 context 占用率的彩色进度条：70% 变黄、85% 变红
@@ -835,6 +856,7 @@ class WeaveTuiApp(App[None]):
                         "permission.*",
                         "context.*",
                         "skill.*",
+                        "subagent.*",
                     ],
                     "scope": "global",
                 }
@@ -979,11 +1001,43 @@ class WeaveTuiApp(App[None]):
         elif t == "run.started":
             run_id = event.get("run_id", "")
             goal = event.get("goal", "")
+            self._subagent_done.clear()  # 新一轮开始，清空上一轮的子 Agent 进度
             self._update_header("running")
             self._append(Static(
                 f"[dim]run[/dim]  [cyan]{run_id}[/cyan]  [dim]{_preview(goal, 96)}[/dim]",
                 classes="run-header",
             ))
+
+        elif t == "subagent.started":
+            run_id = event.get("run_id", "")
+            description = str(event.get("description") or event.get("title") or "")
+            self._subagent_run_ids[run_id] = description
+            short_id = run_id[:8] if len(run_id) >= 8 else run_id
+            self._append(Static(
+                f"[dim]┌─[/dim] [cyan]{_preview(description, 72)}[/cyan]  [dim]{short_id}[/dim]",
+                classes="log-line",
+            ))
+            self._update_header(self._header_state)
+
+        elif t == "subagent.finished":
+            run_id = event.get("run_id", "")
+            status = str(event.get("status") or "success")
+            description = self._subagent_run_ids.pop(
+                run_id, str(event.get("description") or "")
+            )
+            self._subagent_done.append((description, status))
+            desc_part = f"[cyan]{_preview(description, 72)}[/cyan]"
+            if status == "success":
+                self._append(Static(
+                    f"[dim]└─[/dim] [bold green]✓[/bold green] {desc_part}",
+                    classes="log-line",
+                ))
+            else:
+                self._append(Static(
+                    f"[dim]└─[/dim] [bold red]✗[/bold red] {desc_part}",
+                    classes="log-line",
+                ))
+            self._update_header(self._header_state)
 
         elif t == "run.finished":
             status = event.get("status", "")
@@ -1002,6 +1056,9 @@ class WeaveTuiApp(App[None]):
                 ))
 
         elif t == "step.started":
+            run_id = event.get("run_id", "")
+            if run_id in self._subagent_run_ids:
+                return
             self._append(Static(
                 f"[dim]step {event.get('step')}[/dim]",
                 classes="step-divider",
@@ -1011,6 +1068,10 @@ class WeaveTuiApp(App[None]):
             tool_use_id = str(event.get("tool_use_id", ""))
             tool_name = str(event.get("tool_name", ""))
             params = event.get("params") or {}
+            run_id = event.get("run_id", "")
+            # 子 Agent 的工具调用不展示在前台，否则每调一次工具就刷一屏
+            if run_id in self._subagent_run_ids:
+                return
             tc_block = ToolCallBlock(tool_name, params)
             self._pending_tool_blocks[tool_use_id] = tc_block
             self._append(tc_block)
@@ -1033,6 +1094,9 @@ class WeaveTuiApp(App[None]):
                 tc_done.set_result(error_msg, elapsed_ms, is_error=True)
 
         elif t == "llm.usage":
+            run_id = event.get("run_id", "")
+            if run_id in self._subagent_run_ids:
+                return
             pct = float(event.get("context_pct") or 0.0)
             # 每次用量都取当次上报的水位，压缩之后下一次上报自然回落
             self._last_context_pct = pct
