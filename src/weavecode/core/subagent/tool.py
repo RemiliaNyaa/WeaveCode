@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel
 
+from weavecode.core.agents import AgentProfile, AgentProfileLoader
 from weavecode.core.bus.events import SubagentFinishedEvent, SubagentStartedEvent
 from weavecode.core.context import ExecutionContext
 from weavecode.core.events.bus import EventBus
@@ -32,6 +33,8 @@ class SpawnAgentParams(BaseModel):
     prompt: str
     # 后台派生：立即拿到 run_id，稍后用 agent_result 取结果
     run_in_background: bool = False
+    # 角色名：按角色配置加载系统提示与工具白名单，留空用主 Agent 的默认提示
+    subagent_type: str = ""
 
 
 # 在隔离的冷启动上下文中派生子 agent；默认阻塞等结果
@@ -56,6 +59,8 @@ class SpawnAgentTool(BaseTool):
         "- Set run_in_background=true to start the sub-agent without waiting: the call "
         "returns immediately with a run_id, and you collect the result later with "
         "agent_result(run_id=...).\n"
+        "- subagent_type picks the role profile (its own system prompt and tool "
+        "whitelist). Use it to get a read-only planner or reviewer.\n"
         "- To run several sub-agents in parallel, issue MULTIPLE spawn_agent tool calls "
         "in a single tool-calling step (one call per sub-task). The system executes them "
         "concurrently. Do NOT wait for one to finish before issuing the next.\n"
@@ -86,6 +91,13 @@ class SpawnAgentTool(BaseTool):
                     "(collect the result later with agent_result). Defaults to false."
                 ),
             },
+            "subagent_type": {
+                "type": "string",
+                "description": (
+                    "Role profile of the sub-agent (e.g. planner / executor / reviewer). "
+                    "Empty uses the default profile-less sub-agent."
+                ),
+            },
         },
         "required": ["description", "prompt"],
     }
@@ -113,6 +125,7 @@ class SpawnAgentTool(BaseTool):
         self._runs_dir = runs_dir
         self._task_registry = task_registry
         self._depth = depth
+        self._profile_loader = AgentProfileLoader()
 
     # 派生子 agent：默认阻塞等结果，run_in_background=true 时登记后台任务并立即返回 run_id
     async def invoke(self, params: dict[str, object]) -> ToolResult:
@@ -122,14 +135,16 @@ class SpawnAgentTool(BaseTool):
                 content="Subagent nesting limit (2) reached; cannot spawn further subagents.",
                 is_error=True,
             )
+        profile = self._profile_loader.resolve(p.subagent_type) if p.subagent_type else None
         child_run_id = new_run_id()
         child_context = ExecutionContext(
             run_id=child_run_id,
             goal=p.prompt,
             max_steps=self._max_steps,
+            system_prompt_override=profile.system_prompt if profile else None,
         )
         if p.run_in_background:
-            task = asyncio.create_task(self._run_child(child_run_id, child_context, p))
+            task = asyncio.create_task(self._run_child(child_run_id, child_context, p, profile))
             self._task_registry.register(child_run_id, task, child_context)
             return ToolResult(
                 content=(
@@ -137,11 +152,15 @@ class SpawnAgentTool(BaseTool):
                     f"Use agent_result(run_id='{child_run_id}') to retrieve result."
                 )
             )
-        return await self._run_child(child_run_id, child_context, p)
+        return await self._run_child(child_run_id, child_context, p, profile)
 
     # 跑一个子 Agent：冷启动上下文 + 事件桥接 + 写事件文件，返回它的结果
     async def _run_child(
-        self, child_run_id: str, child_context: ExecutionContext, p: SpawnAgentParams
+        self,
+        child_run_id: str,
+        child_context: ExecutionContext,
+        p: SpawnAgentParams,
+        profile: AgentProfile | None,
     ) -> ToolResult:
         child_bus = EventBus()
 
@@ -151,7 +170,7 @@ class SpawnAgentTool(BaseTool):
 
         child_bus.subscribe(_bridge)
 
-        child_registry = self._build_child_registry()
+        child_registry = self._build_child_registry(profile)
         child_loop = AgentLoop(
             self._provider,
             child_registry,
@@ -193,12 +212,16 @@ class SpawnAgentTool(BaseTool):
             error_type="runtime_error",
         )
 
-    # 构造子 Agent 的注册表：四个常用内置工具 + 下一层派生与结果查询工具
-    def _build_child_registry(self) -> ToolRegistry:
+    # 构造子 Agent 的注册表：四个常用内置工具 + 下一层派生与结果查询工具，按角色白名单过滤
+    def _build_child_registry(self, profile: AgentProfile | None) -> ToolRegistry:
+        allowed = set(profile.allowed_tools) if profile and profile.allowed_tools else None
+
+        def _allowed(name: str) -> bool:
+            return allowed is None or name in allowed
+
         registry = ToolRegistry()
-        for tool in (ReadFileTool(), BashTool(), WriteFileTool(), ListDirTool()):
-            registry.register(tool)
-        registry.register(
+        candidates: list[BaseTool] = [ReadFileTool(), BashTool(), WriteFileTool(), ListDirTool()]
+        candidates.append(
             SpawnAgentTool(
                 provider=self._provider,
                 parent_bus=self._parent_bus,
@@ -211,5 +234,8 @@ class SpawnAgentTool(BaseTool):
                 depth=self._depth + 1,
             )
         )
-        registry.register(AgentResultTool(self._task_registry))
+        candidates.append(AgentResultTool(self._task_registry))
+        for tool in candidates:
+            if _allowed(tool.name):
+                registry.register(tool)
         return registry
