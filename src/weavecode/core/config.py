@@ -58,6 +58,21 @@ class CompactionConfig:
 
 
 @dataclass
+class McpServerConfig:
+    name: str
+    transport: str = "stdio"  # "stdio" | "http"
+    command: str = ""         # stdio 专用：可执行文件路径
+    args: list[str] = field(default_factory=list)
+    env: dict[str, str] = field(default_factory=dict)
+    url: str = ""             # http 专用：远程 server 端点
+
+
+@dataclass
+class McpConfig:
+    servers: list[McpServerConfig] = field(default_factory=list)
+
+
+@dataclass
 class WeaveConfig:
     host: str = _DEFAULT_HOST
     port: int = _DEFAULT_PORT
@@ -67,6 +82,7 @@ class WeaveConfig:
     trace: TraceConfig = field(default_factory=TraceConfig)
     permission: PermissionConfig = field(default_factory=PermissionConfig)
     compaction: CompactionConfig = field(default_factory=CompactionConfig)
+    mcp: McpConfig = field(default_factory=McpConfig)
 
 
 # 构建并返回运行时配置：默认值 → TOML → .env → WEAVE_* 环境变量（后者优先级最高）
@@ -219,6 +235,36 @@ def _apply_toml(config: WeaveConfig, data: dict[str, Any]) -> None:
     tool_keep = _read_int(comp, "tool_result_keep", "compaction.tool_result_keep")
     if tool_keep is not None:
         config.compaction.tool_result_keep = tool_keep
+
+    # 服务器清单：[[mcp.servers]] 数组表，命令行启动（stdio）或远程地址（http）两种形态
+    mcp = _section(data, "mcp")
+    servers_raw = mcp.get("servers")
+    if servers_raw is not None:
+        if not isinstance(servers_raw, list):
+            raise SystemExit("Config error: mcp.servers must be an array of tables")
+        for entry in servers_raw:
+            if not isinstance(entry, dict):
+                raise SystemExit("Config error: each mcp.servers entry must be a table")
+            name = entry.get("name")
+            if not isinstance(name, str) or not name:
+                raise SystemExit("Config error: each mcp.servers entry needs a non-empty name")
+            server = McpServerConfig(name=name)
+            transport = _read_str(entry, "transport", "mcp.servers.transport")
+            if transport is not None:
+                server.transport = transport
+            command = _read_str(entry, "command", "mcp.servers.command")
+            if command is not None:
+                server.command = command
+            args = _read_str_list(entry, "args", "mcp.servers.args")
+            if args is not None:
+                server.args = args
+            env = _read_str_table(entry, "env", "mcp.servers.env")
+            if env is not None:
+                server.env = env
+            url = _read_str(entry, "url", "mcp.servers.url")
+            if url is not None:
+                server.url = url
+            config.mcp.servers.append(server)
 
 
 # 用 WEAVE_* 环境变量覆盖 config 中对应字段（若变量已设置）

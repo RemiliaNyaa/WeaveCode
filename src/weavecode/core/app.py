@@ -39,6 +39,7 @@ from weavecode.core.config import WeaveConfig, get_config
 from weavecode.core.events.bus import EventBus
 from weavecode.core.llm.provider import AnthropicProvider
 from weavecode.core.logging_setup import setup_logging
+from weavecode.core.mcp.server import McpServerManager
 from weavecode.core.permissions.manager import PermissionManager
 from weavecode.core.runner import AgentRunner
 from weavecode.core.runs import events_file, new_run_id
@@ -65,6 +66,7 @@ class CoreApp:
         self._running_runs: set[asyncio.Task[Any]] = set()
         self._sessions: SessionManager | None = None
         self._permission_manager: PermissionManager | None = None
+        self._mcp_manager: McpServerManager | None = None
 
     # 处理 core.ping 请求，返回服务版本、运行时长和接收时间
     async def _ping_handler(self, params: dict[str, Any]) -> PongResult:
@@ -232,6 +234,9 @@ class CoreApp:
         assert self._config is not None
         compact_provider = AnthropicProvider(self._config.llm.default_model)
 
+        # MCP manager 先建对象：run 的 registry 工厂要靠它取工具
+        self._mcp_manager = McpServerManager()
+
         self._sessions = SessionManager(
             store,
             runner_factory=lambda: AgentRunner(
@@ -239,11 +244,16 @@ class CoreApp:
                 bus=self._bus,
                 trace=self._trace,
                 permission_manager=self._permission_manager,
+                mcp_manager=self._mcp_manager,
             ),
             bus=self._bus,
             provider=compact_provider,
             compaction_keep_tokens=self._config.compaction.keep_tokens,
         )
+
+        if self._config.mcp.servers:
+            logger.info("mcp: starting %d server(s)", len(self._config.mcp.servers))
+            await self._mcp_manager.start_all(self._config.mcp.servers)
 
         server = SocketServer(
             self._config.host,
@@ -282,6 +292,8 @@ class CoreApp:
             run_task.cancel()
         if self._running_runs:
             await asyncio.gather(*self._running_runs, return_exceptions=True)
+        if self._mcp_manager is not None:
+            await self._mcp_manager.stop_all()
         await server.stop()
         if self._trace is not None:
             await self._trace.stop()

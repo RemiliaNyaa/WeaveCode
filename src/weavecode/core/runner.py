@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from weavecode.core.bus.events import RunFinishedEvent, RunStartedEvent
+from weavecode.core.compact.compactor import Compactor
 from weavecode.core.config import WeaveConfig
 from weavecode.core.context import ExecutionContext
 from weavecode.core.events.bus import EventBus, EventHandler
@@ -14,10 +15,12 @@ from weavecode.core.events.writer import EventWriter
 from weavecode.core.llm.base import LLMProvider
 from weavecode.core.llm.provider import AnthropicProvider
 from weavecode.core.loop import AgentLoop
+from weavecode.core.mcp.server import McpServerManager
 from weavecode.core.permissions.manager import PermissionManager
 from weavecode.core.runs import RUNS_DIR, new_run_id
 from weavecode.core.session.model import Session
 from weavecode.core.session.store import SessionStore
+from weavecode.core.subagent.tool import SpawnAgentTool
 from weavecode.core.task import TaskManager
 from weavecode.core.trace.provider import TracingProvider
 from weavecode.core.trace.writer import TraceWriter
@@ -40,6 +43,13 @@ log = logging.getLogger(__name__)
 def _now() -> str:
     return datetime.now(UTC).isoformat()
 
+# 读取规则文件全文；文件不存在或读不到时返回空串
+def _read_rules(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
 
 @dataclass
 class RunOutcome:
@@ -59,6 +69,7 @@ class AgentRunner:
         extra_handlers: list[EventHandler] | None = None,
         trace: TraceWriter | None = None,
         permission_manager: PermissionManager | None = None,
+        mcp_manager: McpServerManager | None = None,
         runs_dir: Path | None = None,
     ) -> None:
         self._config = config
@@ -67,6 +78,7 @@ class AgentRunner:
         self._extra_handlers: list[EventHandler] = extra_handlers or []
         self._trace = trace
         self._permission_manager = permission_manager
+        self._mcp_manager = mcp_manager
         self._runs_dir = runs_dir if runs_dir is not None else RUNS_DIR
 
     # 执行一次 agent run（委托给 run_and_capture）
@@ -81,6 +93,7 @@ class AgentRunner:
         run_id: str | None = None,
         session: Session | None = None,
         store: SessionStore | None = None,
+        task_manager: TaskManager | None = None,
     ) -> RunOutcome:
         run_id = run_id or new_run_id()
         # 有会话时读回整段历史并挂到会话的运行目录下，否则从 goal 起一份全新历史
@@ -88,16 +101,22 @@ class AgentRunner:
             run_path = store.runs_dir(session.id) / run_id
             history = store.read_messages(session.id)
             notes = store.read_notes(session.id)
+            session_dir = store.session_dir(session.id)
         else:
             run_path = self._runs_dir / run_id
             history = [{"role": "user", "content": goal}]
             notes = ""
+            session_dir = run_path
         run_path.mkdir(parents=True, exist_ok=True)
 
         # 建立事件总线，订阅调用方传进来的监听者
         bus = self._bus if self._bus is not None else EventBus()
         for h in self._extra_handlers:
             bus.subscribe(h)
+
+        # 记忆背景：全局与项目两级上下文文件，文件不存在或为空时按空串处理
+        global_ctx = _read_rules(Path("~/.weave/context.md").expanduser())
+        project_ctx = _read_rules(Path(".weave/context.md"))
 
         # 工作记忆在这里建立：完整历史回放，goal 只在没有历史时作为第一条消息
         context = ExecutionContext(
@@ -106,10 +125,13 @@ class AgentRunner:
             max_steps=self._config.agent.max_steps,
             prefill_messages=history,
             session_notes=notes,
+            global_context=global_ctx,
+            project_context=project_ctx,
         )
 
-        # 本次运行的任务存储：放在 run 目录下，同一次 run 内的工具共享同一份状态
-        task_manager = TaskManager(run_path / ".tasks")
+        # 任务归属会话：调用方注入实例时跨 run 复用，否则按会话目录兜底
+        if task_manager is None:
+            task_manager = TaskManager(session_dir / ".tasks")
         session_id = session.id if session is not None else ""
 
         # 事件文件用 async with 打开：无论正常结束、报错还是被中断都会正确关闭
@@ -130,8 +152,14 @@ class AgentRunner:
                         include_payload=self._config.trace.include_llm_payload,
                     )
                 registry = self._build_registry(
-                    task_manager, run_id=run_id, session=session, store=store
+                    task_manager,
+                    run_id=run_id,
+                    provider=provider,
+                    bus=bus,
+                    session=session,
+                    store=store,
                 )
+                compactor = Compactor(bus, session_dir=session_dir)
                 loop = AgentLoop(
                     provider,
                     registry,
@@ -139,6 +167,7 @@ class AgentRunner:
                     tasks=task_manager,
                     session_id=session_id,
                     permission_manager=self._permission_manager,
+                    compactor=compactor,
                 )
                 await loop.run(context)
             except asyncio.CancelledError:
@@ -171,12 +200,14 @@ class AgentRunner:
             reason=context.reason,
         )
 
-    # 构建本次运行的工具注册表：内置文件工具 + 任务工具（共用同一个任务存储）
+    # 构建本次运行的工具注册表：内置文件工具 + 任务工具 + 外部工具服务器的工具
     def _build_registry(
         self,
         task_manager: TaskManager,
         *,
         run_id: str | None = None,
+        provider: LLMProvider | None = None,
+        bus: EventBus | None = None,
         session: Session | None = None,
         store: SessionStore | None = None,
     ) -> ToolRegistry:
@@ -193,4 +224,23 @@ class AgentRunner:
         # 笔记工具只在 session run 里注册：没有 session 就没有写入目标
         if session is not None and store is not None and run_id is not None:
             registry.register(NoteSaveTool(store, session.id, run_id))
+
+        mcp_tools = self._mcp_manager.get_tools() if self._mcp_manager is not None else []
+
+        # 派生子 Agent 的工具只给主 Agent：子 Agent 的注册表不再登记派生工具
+        if provider is not None and bus is not None and run_id is not None:
+            registry.register(
+                SpawnAgentTool(
+                    provider=provider,
+                    parent_bus=bus,
+                    parent_run_id=run_id,
+                    permission_manager=self._permission_manager,
+                    max_steps=self._config.agent.max_steps,
+                    session_id=session.id if session is not None else "",
+                    runs_dir=self._runs_dir,
+                )
+            )
+
+        for mcp_tool in mcp_tools:
+            registry.register(mcp_tool)
         return registry
