@@ -14,7 +14,7 @@ from weavecode.core.events.bus import EventBus
 from weavecode.core.events.writer import EventWriter
 from weavecode.core.loop import AgentLoop
 from weavecode.core.runs import new_run_id
-from weavecode.core.subagent.registry import AgentResultTool, BackgroundTaskRegistry
+from weavecode.core.subagent.registry import BackgroundTaskRegistry
 from weavecode.core.tools.base import BaseTool, ToolResult
 from weavecode.core.tools.builtin import BashTool, ListDirTool, ReadFileTool, WriteFileTool
 from weavecode.core.tools.registry import ToolRegistry
@@ -67,7 +67,8 @@ class SpawnAgentTool(BaseTool):
         "- The sub-agent starts with a clean context containing ONLY the provided prompt "
         "- it does NOT inherit the current conversation history. Be explicit and "
         "self-contained in prompt.\n"
-        "- The sub-agent may spawn further sub-agents up to a nesting limit of 2.\n"
+        "- The sub-agent has the same tools as you, except it cannot spawn further "
+        "sub-agents (no nesting).\n"
         "- description should be a short 3-5 word label shown in progress display."
     )
     input_schema: dict[str, Any] = {
@@ -103,7 +104,7 @@ class SpawnAgentTool(BaseTool):
     }
     params_model = SpawnAgentParams
 
-    # 构造派生工具：depth 记录当前所处的嵌套层级，主 Agent 为 0
+    # 构造派生工具：只有主 Agent 持有它，层级固定为主、子两级
     def __init__(
         self,
         provider: LLMProvider,
@@ -114,7 +115,6 @@ class SpawnAgentTool(BaseTool):
         session_id: str,
         runs_dir: Path,
         task_registry: BackgroundTaskRegistry,
-        depth: int = 0,
     ) -> None:
         self._provider = provider
         self._parent_bus = parent_bus
@@ -124,17 +124,11 @@ class SpawnAgentTool(BaseTool):
         self._session_id = session_id
         self._runs_dir = runs_dir
         self._task_registry = task_registry
-        self._depth = depth
         self._profile_loader = AgentProfileLoader()
 
     # 派生子 agent：默认阻塞等结果，run_in_background=true 时登记后台任务并立即返回 run_id
     async def invoke(self, params: dict[str, object]) -> ToolResult:
         p = SpawnAgentParams.model_validate(params)
-        if self._depth >= 2:
-            return ToolResult(
-                content="Subagent nesting limit (2) reached; cannot spawn further subagents.",
-                is_error=True,
-            )
         profile = self._profile_loader.resolve(p.subagent_type) if p.subagent_type else None
         child_run_id = new_run_id()
         child_context = ExecutionContext(
@@ -212,30 +206,11 @@ class SpawnAgentTool(BaseTool):
             error_type="runtime_error",
         )
 
-    # 构造子 Agent 的注册表：四个常用内置工具 + 下一层派生与结果查询工具，按角色白名单过滤
+    # 构造子 Agent 的注册表：只给内置工具（不含派生与结果查询），再按角色白名单过滤
     def _build_child_registry(self, profile: AgentProfile | None) -> ToolRegistry:
         allowed = set(profile.allowed_tools) if profile and profile.allowed_tools else None
-
-        def _allowed(name: str) -> bool:
-            return allowed is None or name in allowed
-
         registry = ToolRegistry()
-        candidates: list[BaseTool] = [ReadFileTool(), BashTool(), WriteFileTool(), ListDirTool()]
-        candidates.append(
-            SpawnAgentTool(
-                provider=self._provider,
-                parent_bus=self._parent_bus,
-                parent_run_id=self._parent_run_id,
-                permission_manager=self._permission_manager,
-                max_steps=self._max_steps,
-                session_id=self._session_id,
-                runs_dir=self._runs_dir,
-                task_registry=self._task_registry,
-                depth=self._depth + 1,
-            )
-        )
-        candidates.append(AgentResultTool(self._task_registry))
-        for tool in candidates:
-            if _allowed(tool.name):
+        for tool in (ReadFileTool(), BashTool(), WriteFileTool(), ListDirTool()):
+            if allowed is None or tool.name in allowed:
                 registry.register(tool)
         return registry
