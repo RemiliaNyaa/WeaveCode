@@ -38,13 +38,21 @@ def matches_outside_cwd(command: str) -> bool:
     return any(re.search(pat, command) for pat in OUTSIDE_CWD_HEURISTICS)
 
 
-# 工具默认策略：影响外部世界的操作默认询问，只读操作直接放行
+# 工具默认策略：按「是否影响外部世界」划分，Agent 内部的事默认放行
 DEFAULT_POLICIES: dict[str, ToolPolicy] = {
-    "bash":       ToolPolicy(default=PermissionDecision.ASK),
-    "write_file": ToolPolicy(default=PermissionDecision.ASK),
+    "bash":       ToolPolicy(default=PermissionDecision.ASK),   # 执行命令，影响外部
+    "write_file": ToolPolicy(default=PermissionDecision.ASK),   # 写文件，影响外部
     "read_file":  ToolPolicy(default=PermissionDecision.ALLOW),
     "list_dir":   ToolPolicy(default=PermissionDecision.ALLOW),
     "note_save":  ToolPolicy(default=PermissionDecision.ALLOW),
+    # 任务管理类：Agent 自己拆解、推进任务的内部操作
+    "task_list":    ToolPolicy(default=PermissionDecision.ALLOW),
+    "task_get":     ToolPolicy(default=PermissionDecision.ALLOW),
+    "task_create":  ToolPolicy(default=PermissionDecision.ALLOW),
+    "task_update":  ToolPolicy(default=PermissionDecision.ALLOW),
+    # 查询子 Agent 结果与派生子 Agent 本身没有副作用
+    "agent_result": ToolPolicy(default=PermissionDecision.ALLOW),
+    "spawn_agent":  ToolPolicy(default=PermissionDecision.ALLOW),
 }
 
 # 未在 DEFAULT_POLICIES 中登记的工具（如 MCP 工具）的兜底策略：保守询问
