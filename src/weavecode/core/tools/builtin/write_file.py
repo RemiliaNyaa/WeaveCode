@@ -20,14 +20,16 @@ class WriteFileTool(BaseTool):
     name = "write_file"
     description = (
         "Write text content to a file. An existing file is replaced entirely.\n"
-        "Path must be relative to the current working directory."
+        "Path may be absolute or relative to the current working directory."
     )
     input_schema: dict[str, object] = {
         "type": "object",
         "properties": {
             "path": {
                 "type": "string",
-                "description": "File path relative to the current working directory.",
+                "description": (
+                    "File path, absolute or relative to the current working directory."
+                ),
             },
             "content": {
                 "type": "string",
@@ -37,11 +39,9 @@ class WriteFileTool(BaseTool):
         "required": ["path", "content"],
     }
 
-    # 写入文件（已存在即整体覆盖）；路径按工作目录规范化，行尾按内容原样落盘
+    # 写入文件（已存在即整体覆盖）；越界与否交给权限层判定
     async def invoke(self, params: dict[str, object]) -> ToolResult:
         p = WriteFileParams.model_validate(params)
-        if ".." in Path(p.path).parts:
-            raise PermissionError(f"path traversal not allowed: {p.path}")
 
         path = Path(p.path)
         if not path.is_absolute():

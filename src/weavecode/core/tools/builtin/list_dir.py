@@ -22,7 +22,7 @@ class ListDirTool(BaseTool):
     name = "list_dir"
     description = (
         "List a directory tree recursively.\n"
-        "Path must be relative to the current working directory.\n"
+        "Path may be absolute or relative to the current working directory.\n"
         f"Default depth is {_DEFAULT_DEPTH} (max {_MAX_DEPTH})."
     )
     input_schema: dict[str, object] = {
@@ -30,7 +30,9 @@ class ListDirTool(BaseTool):
         "properties": {
             "path": {
                 "type": "string",
-                "description": "Directory path relative to the current working directory.",
+                "description": (
+                    "Directory path, absolute or relative to the current working directory."
+                ),
             },
             "max_depth": {
                 "type": "integer",
@@ -42,11 +44,9 @@ class ListDirTool(BaseTool):
         "required": ["path"],
     }
 
-    # 树状递归展示目录：路径按工作目录规范化，默认深度 2，按 200 条截断
+    # 树状递归展示目录：越界与否交给权限层判定，默认深度 2，按 200 条截断
     async def invoke(self, params: dict[str, object]) -> ToolResult:
         p = ListDirParams.model_validate(params)
-        if ".." in Path(p.path).parts:
-            raise PermissionError(f"path traversal not allowed: {p.path}")
 
         root = Path(p.path)
         if not root.is_absolute():

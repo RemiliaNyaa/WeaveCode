@@ -19,24 +19,24 @@ class ReadFileTool(BaseTool):
     name = "read_file"
     description = (
         "Read the content of a file.\n"
-        "Path must be relative to the current working directory."
+        "Path may be absolute or relative to the current working directory."
     )
     input_schema: dict[str, object] = {
         "type": "object",
         "properties": {
             "path": {
                 "type": "string",
-                "description": "File path relative to the current working directory.",
+                "description": (
+                    "File path, absolute or relative to the current working directory."
+                ),
             },
         },
         "required": ["path"],
     }
 
-    # 读整个文件返回纯文本，超过 512 KB 截断；路径按工作目录规范化
+    # 读整个文件返回纯文本，超过 512 KB 截断；越界与否交给权限层判定
     async def invoke(self, params: dict[str, object]) -> ToolResult:
         p = ReadFileParams.model_validate(params)
-        if ".." in Path(p.path).parts:
-            raise PermissionError(f"path traversal not allowed: {p.path}")
 
         path = Path(p.path)
         if not path.is_absolute():
