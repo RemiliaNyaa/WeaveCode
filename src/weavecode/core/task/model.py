@@ -33,3 +33,17 @@ class Task:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
+
+    # 从 task_{id}.json 读回：内存副本与文件字段一一对应，往返不丢信息
+    @classmethod
+    def from_dict(cls, data: dict[str, object]) -> Task:
+        blocked = data.get("blocked_by") or []
+        return cls(
+            id=int(data["id"]),
+            subject=str(data["subject"]),
+            description=str(data.get("description", "")),
+            status=str(data.get("status", "pending")),
+            blocked_by=[int(x) for x in blocked],
+            created_at=str(data.get("created_at") or _now()),
+            updated_at=str(data.get("updated_at") or _now()),
+        )

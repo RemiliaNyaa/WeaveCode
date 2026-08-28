@@ -20,6 +20,7 @@ from weavecode.core.runs import new_run_id
 from weavecode.core.session.model import Session, SessionMode
 from weavecode.core.session.store import SessionStore
 from weavecode.core.skills.loader import SkillLoader
+from weavecode.core.task import TaskManager
 
 if TYPE_CHECKING:
     from weavecode.core.llm.base import LLMProvider
@@ -50,6 +51,7 @@ class SessionManager:
         self._provider = provider
         self._sessions: dict[str, Session] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+        self._task_managers: dict[str, TaskManager] = {}
 
     # 创建新 session 并写入 meta.json
     async def create(self, mode: SessionMode, title: str = "") -> Session:
@@ -123,8 +125,17 @@ class SessionManager:
                 session.title = content[:40]
 
             runner = self._runner_factory()
+            # 复用本 session 缓存的任务管理器实例（同 session 跨 run 复用同一份任务状态）
+            task_manager = self._task_managers.get(sid)
+            if task_manager is None:
+                task_manager = TaskManager(self._store.session_dir(sid) / ".tasks")
+                self._task_managers[sid] = task_manager
             await runner.run_and_capture(
-                content, run_id=run_id, session=session, store=self._store
+                content,
+                run_id=run_id,
+                session=session,
+                store=self._store,
+                task_manager=task_manager,
             )
 
             session.updated_at = _now()
@@ -155,6 +166,7 @@ class SessionManager:
             session.status = "closed"
             session.updated_at = _now()
             self._store.write_meta(session)
+            self._task_managers.pop(sid, None)  # 关闭会话时释放缓存的任务管理器
             await self._bus.publish(SessionClosedEvent(session_id=sid, ts=session.updated_at))
 
     # 手动压缩指定 session 的 thread，将摘要持久化写入 thread.jsonl

@@ -6,14 +6,19 @@ from pathlib import Path
 from weavecode.core.task.model import Task, _now
 
 
-# 任务存储：每个任务一个 task_{id}.json，纯同步的文件 CRUD 层
+# 任务存储：每个任务一个 task_{id}.json
+#
+# 目录由调用方按「会话目录」传入，实例由 SessionManager 按 session 缓存复用——
+# 运行期间读内存副本（快），每次写都落盘（崩溃/重启不丢），id 跨 run 连续不再归零。
 class TaskManager:
     def __init__(self, tasks_dir: Path) -> None:
         self._dir = Path(tasks_dir)
         self._dir.mkdir(parents=True, exist_ok=True)
+        self._tasks: dict[int, Task] = {}
+        self._loaded = False
         self._next_id = self._max_id() + 1
 
-    # 新建任务：写盘后自增编号
+    # 新建任务：写进内存副本并落盘，然后自增编号
     def create(
         self,
         subject: str,
@@ -27,23 +32,19 @@ class TaskManager:
             blocked_by=list(blocked_by or []),
         )
         self._next_id += 1
+        self._tasks[task.id] = task
         self._save(task)
         return task
 
-    # 按 id 取单个任务，文件不存在返回 None
+    # 按 id 取单个任务，没有则返回 None
     def get(self, task_id: int) -> Task | None:
-        return self._load(task_id)
+        self._ensure_loaded()
+        return self._tasks.get(task_id)
 
     # 列出全部任务（按 id 升序），可按状态过滤
     def list(self, status: str | None = None) -> list[Task]:
-        tasks: list[Task] = []
-        for path in self._dir.glob("task_*.json"):
-            task = self._load(self._parse_id(path))
-            if task is None:
-                continue
-            if status is not None and task.status != status:
-                continue
-            tasks.append(task)
+        self._ensure_loaded()
+        tasks = [task for task in self._tasks.values() if status is None or task.status == status]
         tasks.sort(key=lambda item: item.id)
         return tasks
 
@@ -57,7 +58,8 @@ class TaskManager:
         add_blocked_by: list[int] | None = None,
         remove_blocked_by: list[int] | None = None,
     ) -> Task:
-        task = self._load(task_id)
+        self._ensure_loaded()
+        task = self._tasks.get(task_id)
         if task is None:
             raise KeyError(f"task not found: {task_id}")
 
@@ -80,37 +82,37 @@ class TaskManager:
 
     # 前置依赖查询：这个任务还在等哪些任务完成
     def blocked_by(self, task_id: int) -> list[Task]:
-        task = self._load(task_id)
+        self._ensure_loaded()
+        task = self._tasks.get(task_id)
         if task is None:
             return []
         deps: list[Task] = []
         for dep_id in task.blocked_by:
-            dep = self._load(dep_id)
+            dep = self._tasks.get(dep_id)
             if dep is not None:
                 deps.append(dep)
         return deps
+
+    # 首次访问时把目录里的任务文件读进内存，之后一律读内存副本
+    def _ensure_loaded(self) -> None:
+        if self._loaded:
+            return
+        for path in self._dir.glob("task_*.json"):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                task = Task.from_dict(data)
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+            self._tasks[task.id] = task
+        self._loaded = True
+        if self._next_id <= max(self._tasks, default=0):
+            self._next_id = max(self._tasks) + 1
 
     # 单个任务的文件路径
     def _path(self, task_id: int) -> Path:
         return self._dir / f"task_{task_id}.json"
 
-    # 读一个任务文件
-    def _load(self, task_id: int) -> Task | None:
-        path = self._path(task_id)
-        if not path.is_file():
-            return None
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return Task(
-            id=int(data["id"]),
-            subject=str(data["subject"]),
-            description=str(data.get("description", "")),
-            status=str(data.get("status", "pending")),
-            blocked_by=[int(x) for x in (data.get("blocked_by") or [])],
-            created_at=str(data.get("created_at") or _now()),
-            updated_at=str(data.get("updated_at") or _now()),
-        )
-
-    # 写回任务文件
+    # 写回任务文件（内存副本同步更新）
     def _save(self, task: Task) -> None:
         self._path(task.id).write_text(
             json.dumps(task.to_dict(), indent=2, ensure_ascii=False),
@@ -133,15 +135,11 @@ class TaskManager:
         except ValueError:
             return 0
 
-    # 任务完成时解除依赖：把 blocked_by 里含该 id 的条目全部移除
+    # 任务完成时解除依赖：把 blocked_by 里含该 id 的条目全部移除，内存与文件一起改
     def _clear_dependency(self, completed_id: int) -> None:
-        for path in self._dir.glob("task_*.json"):
-            data = json.loads(path.read_text(encoding="utf-8"))
-            blocked = [int(x) for x in data.get("blocked_by", [])]
-            if completed_id in blocked:
-                data["blocked_by"] = [x for x in blocked if x != completed_id]
-                data["updated_at"] = _now()
-                path.write_text(
-                    json.dumps(data, indent=2, ensure_ascii=False),
-                    encoding="utf-8",
-                )
+        for task in list(self._tasks.values()):
+            if completed_id not in task.blocked_by:
+                continue
+            task.blocked_by = [x for x in task.blocked_by if x != completed_id]
+            task.updated_at = _now()
+            self._save(task)
