@@ -81,30 +81,35 @@ def param_preview(tool_name: str, params: dict[str, Any]) -> str:
     return snippet[:_PREVIEW_MAX] if len(snippet) > _PREVIEW_MAX else snippet
 
 
-# 静态判定：黑名单 → 越界 → 白名单 → 默认策略
-def evaluate(
+# 硬规则：黑名单 + 越界，不可被任何缓存/白名单绕过；未命中返回 None
+def evaluate_hard(
     tool_name: str,
     params: dict[str, Any],
-    policy: ToolPolicy | None = None,
-) -> PermissionDecision:
-    if policy is None:
-        policy = DEFAULT_POLICIES.get(tool_name)
-    if policy is None:
-        return _UNKNOWN_TOOL_DEFAULT
-
+    policy: ToolPolicy,
+) -> PermissionDecision | None:
     command = str(params.get("command", "")) if tool_name == "bash" else ""
+    if not command:
+        return None  # 非 bash 工具没有 command → 无硬规则
 
-    if command:
-        for pat in policy.deny_patterns:
-            if re.search(pat, command):
-                return PermissionDecision.DENY
+    for pat in policy.deny_patterns:       # 黑名单：命中直接拒绝
+        if re.search(pat, command):
+            return PermissionDecision.DENY
 
-    if command and matches_outside_cwd(command):
+    if matches_outside_cwd(command):       # 越界：命中强制询问（安全底线，不可绕过）
         return PermissionDecision.ASK
 
+    return None
+
+
+# 软规则：白名单 + 默认策略，可被缓存覆盖；返回 ALLOW/DENY/ASK
+def evaluate_soft(
+    tool_name: str,
+    params: dict[str, Any],
+    policy: ToolPolicy,
+) -> PermissionDecision:
+    command = str(params.get("command", "")) if tool_name == "bash" else ""
     if command:
-        for pat in policy.allow_patterns:
+        for pat in policy.allow_patterns:   # 白名单：命中直接放行
             if re.search(pat, command):
                 return PermissionDecision.ALLOW
-
     return policy.default

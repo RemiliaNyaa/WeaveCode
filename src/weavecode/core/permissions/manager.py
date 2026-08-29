@@ -3,18 +3,16 @@ from __future__ import annotations
 import asyncio
 import datetime
 import logging
-import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC
 from typing import Any
 
 from weavecode.core.permissions.policy import (
+    _UNKNOWN_TOOL_DEFAULT,
     DEFAULT_POLICIES,
     PermissionDecision,
     ToolPolicy,
-    evaluate,
-    matches_outside_cwd,
     param_preview,
 )
 from weavecode.core.permissions.storage import POLICY_FILE, load_policy, save_policy_file
@@ -33,7 +31,7 @@ class _PendingRequest:
     tool_name: str
 
 
-# 管理工具调用权限：静态规则判定 + 用户审批挂起 + 会话级/持久化两级「始终」缓存 + 超时
+# 管理工具调用权限：硬规则 → 缓存 → 软规则 + 用户审批挂起 + 超时
 class PermissionManager:
     def __init__(
         self,
@@ -54,9 +52,15 @@ class PermissionManager:
         self._policy_file = policy_file
         self._timeout_s = timeout_s
 
-    # 对工具名 + 参数做一次静态评估（不挂起、不改缓存）
+    # 对工具名 + 参数执行硬/软规则评估（无缓存、无挂起）
     def evaluate(self, tool_name: str, params: dict[str, Any]) -> PermissionDecision:
-        return evaluate(tool_name, params, self._policies.get(tool_name))
+        policy = self._policies.get(tool_name)
+        if policy is None:
+            return _UNKNOWN_TOOL_DEFAULT
+        hard = _evaluate_hard(tool_name, params, policy)
+        if hard is not None:
+            return hard
+        return _evaluate_soft(tool_name, params, policy)
 
     # 检查权限；需要 ask 时向客户端发事件并等待 respond
     async def check_and_wait(
@@ -70,48 +74,20 @@ class PermissionManager:
         policy = self._policies.get(tool_name)
         if policy is None:
             # 未登记工具（如 MCP 工具）：保守询问
-            policy = ToolPolicy(default=PermissionDecision.ASK)
-
-        command = str(params.get("command", "")) if tool_name == "bash" else ""
-
-        # 黑名单：命中直接拒绝
-        if command:
-            for pat in policy.deny_patterns:
-                if re.search(pat, command):
-                    return False, "auto_deny"
-
-        # 越界：安全底线，强制询问，不看任何缓存
-        if command and matches_outside_cwd(command):
-            loop = asyncio.get_event_loop()
-            future: asyncio.Future[str] = loop.create_future()
-            self._pending[tool_use_id] = _PendingRequest(
-                future=future,
-                session_id=session_id,
-                tool_name=tool_name,
+            return await self._ask_and_wait(
+                tool_use_id, tool_name, params, session_id, event_emitter
             )
-            await event_emitter(
-                {
-                    "type": "permission.requested",
-                    "tool_use_id": tool_use_id,
-                    "tool_name": tool_name,
-                    "params": params,
-                    "param_preview": param_preview(tool_name, params),
-                    "session_id": session_id,
-                    "ts": _now(),
-                }
-            )
-            try:
-                raw = await asyncio.wait_for(future, timeout=self._timeout_s)
-            except TimeoutError:
-                self._pending.pop(tool_use_id, None)
-                logger.info(
-                    "permission: timeout tool_use_id=%s tool=%s", tool_use_id, tool_name
-                )
-                return False, "timeout"
-            allowed = self._apply_response(raw, session_id, tool_name)
-            return allowed, raw
 
-        # 缓存层：会话级优先，其次持久化（用户「始终」的选择优先于默认策略）
+        # 硬规则：黑名单与越界，不可被任何缓存绕过
+        hard = _evaluate_hard(tool_name, params, policy)
+        if hard == PermissionDecision.DENY:
+            return False, "auto_deny"
+        if hard == PermissionDecision.ASK:
+            return await self._ask_and_wait(
+                tool_use_id, tool_name, params, session_id, event_emitter
+            )
+
+        # 缓存层：会话级优先，其次持久化（用户「始终」的选择优先于软规则）
         session_key = (session_id, tool_name)
         if session_key in self._session_always:
             cached = self._session_always[session_key]
@@ -120,19 +96,26 @@ class PermissionManager:
             cached = self._persistent_always[tool_name]
             return cached == "allow", f"auto_{cached}"
 
-        # 白名单：命中直接放行
-        if command:
-            for pat in policy.allow_patterns:
-                if re.search(pat, command):
-                    return True, "auto_allow"
-
-        # 默认策略
-        if policy.default == PermissionDecision.ALLOW:
+        # 软规则：白名单与默认策略，可被用户的选择覆盖
+        soft = _evaluate_soft(tool_name, params, policy)
+        if soft == PermissionDecision.ALLOW:
             return True, "auto_allow"
-        if policy.default == PermissionDecision.DENY:
+        if soft == PermissionDecision.DENY:
             return False, "auto_deny"
 
-        # 默认 ASK：挂起等用户
+        return await self._ask_and_wait(
+            tool_use_id, tool_name, params, session_id, event_emitter
+        )
+
+    # ASK 挂起：登记 Future、发审批事件、等 respond 或超时
+    async def _ask_and_wait(
+        self,
+        tool_use_id: str,
+        tool_name: str,
+        params: dict[str, Any],
+        session_id: str,
+        event_emitter: Callable[[dict[str, Any]], Awaitable[None]],
+    ) -> tuple[bool, str]:
         loop = asyncio.get_event_loop()
         future: asyncio.Future[str] = loop.create_future()
         self._pending[tool_use_id] = _PendingRequest(
@@ -140,6 +123,7 @@ class PermissionManager:
             session_id=session_id,
             tool_name=tool_name,
         )
+
         await event_emitter(
             {
                 "type": "permission.requested",
@@ -151,14 +135,14 @@ class PermissionManager:
                 "ts": _now(),
             }
         )
+
         try:
             raw = await asyncio.wait_for(future, timeout=self._timeout_s)
         except TimeoutError:
             self._pending.pop(tool_use_id, None)
-            logger.info(
-                "permission: timeout tool_use_id=%s tool=%s", tool_use_id, tool_name
-            )
+            logger.info("permission: timeout tool_use_id=%s tool=%s", tool_use_id, tool_name)
             return False, "timeout"
+
         allowed = self._apply_response(raw, session_id, tool_name)
         return allowed, raw
 
@@ -195,3 +179,19 @@ class PermissionManager:
                     "permission: cancel pending tool_use_id=%s reason=%s", uid, reason
                 )
                 req.future.set_result("deny_once")
+
+
+# 硬规则包装：延迟导入避免循环依赖
+def _evaluate_hard(
+    tool_name: str, params: dict[str, Any], policy: ToolPolicy
+) -> PermissionDecision | None:
+    from weavecode.core.permissions.policy import evaluate_hard
+    return evaluate_hard(tool_name, params, policy)
+
+
+# 软规则包装：延迟导入避免循环依赖
+def _evaluate_soft(
+    tool_name: str, params: dict[str, Any], policy: ToolPolicy
+) -> PermissionDecision:
+    from weavecode.core.permissions.policy import evaluate_soft
+    return evaluate_soft(tool_name, params, policy)

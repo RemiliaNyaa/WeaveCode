@@ -8,6 +8,8 @@ from weavecode.core.permissions.policy import (
     DEFAULT_POLICIES,
     PermissionDecision,
     ToolPolicy,
+    evaluate_hard,
+    evaluate_soft,
 )
 
 # bash / write_file 默认询问；测审批/缓存/超时机制时，
@@ -46,6 +48,24 @@ def test_evaluate_delegates_to_policy() -> None:
     # 未登记工具（如 MCP）→ ASK 兜底
     assert mgr.evaluate("exa__web_search", {"query": "x"}) == PermissionDecision.ASK
 
+
+
+# 功能：验证 evaluate_hard 处理危险命令黑名单（越界此时仍在硬规则内）
+# 设计：危险命令返回 ASK；普通命令返回 None；非 bash 无硬规则
+def test_evaluate_hard_dangerous_only() -> None:
+    bash = ToolPolicy(default=PermissionDecision.ALLOW)
+    assert evaluate_hard("bash", {"command": "ls"}, bash) is None
+    assert evaluate_hard("bash", {"command": "rm -rf /"}, bash) == PermissionDecision.ASK
+    assert evaluate_hard("bash", {"command": "cat /etc/hosts"}, bash) == PermissionDecision.ASK
+    assert evaluate_hard("read_file", {"path": "/etc/hosts"}, bash) is None  # 非 bash 无硬规则
+
+
+# 功能：验证 evaluate_soft 直接返回该工具的默认策略
+# 设计：软规则不读任何名单，只返回传入策略的 default
+def test_evaluate_soft_returns_default() -> None:
+    assert evaluate_soft("bash", {"command": "ls -la"}, ToolPolicy(default=PermissionDecision.ALLOW)) == PermissionDecision.ALLOW
+    assert evaluate_soft("bash", {"command": "cat x"}, ToolPolicy(default=PermissionDecision.ASK)) == PermissionDecision.ASK
+    assert evaluate_soft("read_file", {"path": "x"}, ToolPolicy(default=PermissionDecision.ALLOW)) == PermissionDecision.ALLOW
 
 # ── check_and_wait: ALLOW path ───────────────────────────────────────────────
 
