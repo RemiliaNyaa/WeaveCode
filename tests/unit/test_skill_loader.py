@@ -6,6 +6,7 @@ import pytest
 
 from weavecode.core.skills.loader import SkillLoader
 
+
 # 功能：内建 review skill 应能被 SkillLoader 查找到
 # 设计：直接调用 resolve("review")，不依赖文件系统之外的任何状态
 def test_builtin_skill_found() -> None:
@@ -20,7 +21,6 @@ def test_builtin_skill_found() -> None:
 # 功能：内建 init / summarize / orchestrate skill 均可找到
 # 设计：列举所有内建 skill 名，断言均能解析
 @pytest.mark.parametrize("name", ["init_rules", "review", "summarize", "orchestrate"])
-
 def test_all_builtin_skills_found(name: str) -> None:
     loader = SkillLoader()
     skill = loader.resolve(name)
@@ -29,17 +29,11 @@ def test_all_builtin_skills_found(name: str) -> None:
 
 # 功能：不存在的 skill 名应返回 None
 # 设计：查找一个不存在的名称，断言 resolve 返回 None 而非抛异常
-
-# 功能：不存在的 skill 名应返回 None
-# 设计：查找一个不存在的名称，断言 resolve 返回 None 而非抛异常
 def test_unknown_skill_returns_none() -> None:
     loader = SkillLoader()
     result = loader.resolve("nonexistent_skill_xyz")
     assert result is None
 
-
-# 功能：frontmatter 中的 name / description 应被正确解析，并记录绝对路径
-# 设计：构造含 frontmatter 的 Markdown 文件，通过 _parse_skill_file 解析并验证结果
 
 # 功能：frontmatter 中的 name / description 应被正确解析，并记录绝对路径
 # 设计：构造含 frontmatter 的 Markdown 文件，通过 _parse_skill_file 解析并验证结果
@@ -63,9 +57,6 @@ description: 自定义 skill 测试
 
 # 功能：无 frontmatter 的 Markdown 文件仍可加载
 # 设计：写入纯正文 Markdown，断言解析成功，name 用文件名、description 为空
-
-# 功能：无 frontmatter 的 Markdown 文件仍可加载
-# 设计：写入纯正文 Markdown，断言解析成功，name 用文件名、description 为空
 def test_no_frontmatter(tmp_path: Path) -> None:
     from weavecode.core.skills.loader import _parse_skill_file
 
@@ -77,9 +68,6 @@ def test_no_frontmatter(tmp_path: Path) -> None:
     assert skill.description == ""
     assert skill.path == str(p.resolve())
 
-
-# 功能：项目本地 skill 应覆盖内建同名 skill
-# 设计：在 .weave/skills/ 中写入同名文件，用 monkeypatch 修改 cwd，断言加载到的是本地版本
 
 # 功能：项目本地 skill 应覆盖内建同名 skill
 # 设计：在 .weave/skills/ 中写入同名文件，用 monkeypatch 修改 cwd，断言加载到的是本地版本
@@ -100,3 +88,33 @@ def test_project_overrides_global(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
 
 # 功能：render_catalog 生成 skill 清单（格式 B：- name: desc (file: 绝对路径)）
 # 设计：内建 skill 存在时，清单包含技能名与 file: 绝对路径
+def test_render_catalog() -> None:
+    loader = SkillLoader()
+    catalog = loader.render_catalog()
+    assert "可用技能列表如下" in catalog
+    assert "使用规则" in catalog
+    assert "review" in catalog
+    assert "(file: " in catalog
+
+
+# 功能：user_prompt 返回告知"skill 名 + 路径 + 任务"的 user 消息
+# 设计：手动触发时，user 消息包含 skill 名、绝对路径和任务内容，让 agent 用 read_file 读取
+def test_user_prompt(tmp_path: Path) -> None:
+    from weavecode.core.skills.loader import _parse_skill_file
+
+    content = """\
+---
+name: custom
+description: 测试
+---
+正文内容
+"""
+    p = tmp_path / "custom.md"
+    p.write_text(content, encoding="utf-8")
+    skill = _parse_skill_file(p)
+    prompt = skill.user_prompt("解析loader.py")
+    assert "用户想要使用 skill：custom" in prompt
+    assert f"skill.md 路径：{p.resolve()}" in prompt
+    assert "用户任务：解析loader.py" in prompt
+    # 不注入正文（agent 用 read_file 读）
+    assert "正文内容" not in prompt

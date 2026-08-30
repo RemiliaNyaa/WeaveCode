@@ -9,16 +9,23 @@ from pathlib import Path
 class Skill:
     name: str
     description: str
-    # SKILL.md 绝对路径
+    # SKILL.md 绝对路径（清单渲染 + 手动触发提示用）
     path: str
-    # 正文模板，触发时按参数渲染后作为本次 run 的目标
-    system_prompt_template: str = ""
+
+    # 手动触发时注入的 user 消息：告知"用户想用哪个 skill + 路径 + 任务"，
+    # 让 agent 按系统提示规则用 read_file 读取 SKILL.md 正文
+    def user_prompt(self, task: str) -> str:
+        return (
+            f"用户想要使用 skill：{self.name}\n"
+            f"skill.md 路径：{self.path}\n"
+            f"用户任务：{task}"
+        )
 
 
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 
 
-# 解析 Markdown skill 文件：frontmatter 取 name/description，正文作模板
+# 解析 Markdown skill 文件，提取 frontmatter 的 name/description 和绝对路径
 def _parse_skill_file(path: Path) -> Skill:
     text = path.read_text(encoding="utf-8")
     name = path.stem
@@ -26,7 +33,6 @@ def _parse_skill_file(path: Path) -> Skill:
     abs_path = str(path.resolve())
 
     m = _FRONTMATTER_RE.match(text)
-    template = text[m.end():] if m else text
     if m:
         lines = m.group(1).splitlines()
         i = 0
@@ -42,21 +48,19 @@ def _parse_skill_file(path: Path) -> Skill:
                     fold = val == ">"
                     parts: list[str] = []
                     i += 1
-                    while i < len(lines) and (
-                        lines[i].startswith(" ") or lines[i].startswith("\t")
-                    ):
+                    while i < len(lines) and (lines[i].startswith(" ") or lines[i].startswith("\t")):
                         parts.append(lines[i].strip())
                         i += 1
                     description = (" ".join(parts) if fold else "\n".join(parts)).strip()
                     continue
-                description = val
+                else:
+                    description = val
             i += 1
 
     return Skill(
         name=name,
         description=description,
         path=abs_path,
-        system_prompt_template=template,
     )
 
 
@@ -64,9 +68,14 @@ def _parse_skill_file(path: Path) -> Skill:
 class SkillLoader:
     _BUILTIN_DIR = Path(__file__).parent / "builtin"
 
-    # 项目本地路径：基于当前 cwd resolve 成绝对路径（依赖 daemon 启动 cwd）
-    @staticmethod
-    def _project_dir() -> Path:
+    # 接受会话工作目录；未指定时项目本地回退到当前进程 cwd
+    def __init__(self, working_dir: str | None = None) -> None:
+        self._working_dir = working_dir
+
+    # 项目本地路径：基于会话工作目录解析（未指定时回退到当前 cwd）
+    def _project_dir(self) -> Path:
+        if self._working_dir:
+            return (Path(self._working_dir) / ".weave" / "skills").resolve()
         return Path(".weave/skills").resolve()
 
     # 全局路径：expanduser 展开成绝对路径
@@ -126,22 +135,29 @@ class SkillLoader:
                         pass
         return list(seen.values())
 
-    # 生成系统提示词里的 skill 清单段（每行一个：- 名字: 描述）
+    # 生成系统提示词里的 skill 清单段（格式 B：- name: desc (file: 绝对路径)）
     def render_catalog(self) -> str:
         skills = self.list_all_skills()
+        lines = [
+            "可用技能列表如下：",
+            "",
+        ]
         if not skills:
-            return "当前没有可用技能。"
-        lines = []
-        for skill in sorted(skills, key=lambda s: s.name):
-            desc = skill.description.splitlines()[0] if skill.description else ""
-            lines.append(f"- {skill.name}: {desc}")
+            lines.append("当前没有可用技能。")
+        else:
+            for skill in sorted(skills, key=lambda s: s.name):
+                desc = skill.description.splitlines()[0] if skill.description else ""
+                lines.append(f"- {skill.name}: {desc} (file: {skill.path})")
+        lines += [
+            "",
+            "使用规则：",
+            "1. 只有当任务【清晰匹配】某个技能的描述时，才使用该技能；"
+            "否则直接正常完成任务，不要强行套用技能。",
+            "2. 若用户明确点名某技能（如 @技能名 或 /技能名），则必须使用该技能。",
+            "3. 同时匹配多个技能时，选择覆盖请求的【最少】技能组合。",
+            "4. 决定使用某技能后，先用 read_file 读取该技能 SKILL.md 的完整内容，"
+            "再按其中指令执行。",
+            "5. 若某技能看似可用但无法干净应用（缺文件/指令不清），"
+            "简要说明后选择次优方案继续，不要卡住。",
+        ]
         return "\n".join(lines)
-
-    # 渲染 skill：有 $ARGUMENTS 则替换；无则追加 ARGUMENTS 行，保证参数不丢
-    def render_prompt(self, skill: Skill, arguments: str) -> str:
-        template = skill.system_prompt_template
-        if "$ARGUMENTS" in template:
-            return template.replace("$ARGUMENTS", arguments)
-        if arguments:
-            return template.rstrip() + f"\n\nARGUMENTS: {arguments}"
-        return template
