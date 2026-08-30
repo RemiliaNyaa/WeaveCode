@@ -121,6 +121,9 @@ class SessionManager:
             if not session.title:
                 session.title = content[:40]
 
+            # 手动触发 skill 时把参数文本作为本次 run 的目标，指令消息留给 agent 自己读
+            goal = arguments if skill is not None else content
+
             runner = self._runner_factory()
             # 复用本 session 缓存的任务管理器实例（同 session 跨 run 复用同一份任务状态）
             task_manager = self._task_managers.get(sid)
@@ -128,7 +131,7 @@ class SessionManager:
                 task_manager = TaskManager(self._store.session_dir(sid) / ".tasks")
                 self._task_managers[sid] = task_manager
             await runner.run_and_capture(
-                content,
+                goal,
                 run_id=run_id,
                 session=session,
                 store=self._store,

@@ -137,6 +137,11 @@ class SkillLoader:
             lines.append(f"- {skill.name}: {desc}")
         return "\n".join(lines)
 
-    # 渲染 skill 正文：把 $ARGUMENTS 占位符换成调用时传入的参数
+    # 渲染 skill：有 $ARGUMENTS 则替换；无则追加 ARGUMENTS 行，保证参数不丢
     def render_prompt(self, skill: Skill, arguments: str) -> str:
-        return skill.system_prompt_template.replace("$ARGUMENTS", arguments)
+        template = skill.system_prompt_template
+        if "$ARGUMENTS" in template:
+            return template.replace("$ARGUMENTS", arguments)
+        if arguments:
+            return template.rstrip() + f"\n\nARGUMENTS: {arguments}"
+        return template
