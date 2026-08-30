@@ -1,8 +1,6 @@
 ---
 name: summarize
 description: 将当前 session 对话压缩为人类可读摘要
-allowed_tools:
-  - note_save
 ---
 你是一位技术写作专家。请将当前对话内容整理成一份简洁的人类可读摘要，方便日后回顾。
 

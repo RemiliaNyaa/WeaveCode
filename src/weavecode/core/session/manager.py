@@ -101,10 +101,7 @@ class SessionManager:
                 arguments = parts[1] if len(parts) > 1 else ""
                 skill = SkillLoader().resolve(skill_name)
                 if skill is not None:
-                    instruction = skill.user_prompt(arguments)
-                    if skill.allowed_tools:
-                        instruction += "\n\n可用工具：" + ", ".join(skill.allowed_tools)
-                    self._store.append_message(sid, "user", instruction)
+                    self._store.append_message(sid, "user", skill.user_prompt(arguments))
                     await self._bus.publish(
                         SkillInvokedEvent(
                             skill_name=skill_name,

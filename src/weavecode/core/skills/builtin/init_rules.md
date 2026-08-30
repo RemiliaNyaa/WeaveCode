@@ -1,11 +1,6 @@
 ---
 name: init_rules
 description: 为当前项目建立规则文件，沉淀仓库约定与常用命令
-allowed_tools:
-  - read_file
-  - list_dir
-  - write_file
-  - bash
 ---
 你要为当前项目建立一份规则文件，让后续的 Agent 一开始就了解这个仓库的约定。
 

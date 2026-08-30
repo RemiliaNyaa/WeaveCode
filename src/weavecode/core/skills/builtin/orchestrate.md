@@ -1,12 +1,6 @@
 ---
 name: orchestrate
 description: 用规划 → 执行 → 审查三阶段工作流完成复杂任务
-allowed_tools:
-  - spawn_agent
-  - agent_result
-  - task_create
-  - task_update
-  - task_list
 ---
 你是 multi-agent 协调者。请用下面的三阶段工作流完成目标：
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -11,8 +11,6 @@ class Skill:
     description: str
     # SKILL.md 绝对路径
     path: str
-    # frontmatter 声明的工具白名单；为空表示不限制
-    allowed_tools: list[str] = field(default_factory=list)
     # 正文模板，触发时按参数渲染后作为本次 run 的目标
     system_prompt_template: str = ""
 
@@ -20,12 +18,11 @@ class Skill:
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 
 
-# 解析 Markdown skill 文件：frontmatter 取 name/description/allowed_tools，正文作模板
+# 解析 Markdown skill 文件：frontmatter 取 name/description，正文作模板
 def _parse_skill_file(path: Path) -> Skill:
     text = path.read_text(encoding="utf-8")
     name = path.stem
     description = ""
-    allowed_tools: list[str] = []
     abs_path = str(path.resolve())
 
     m = _FRONTMATTER_RE.match(text)
@@ -53,35 +50,12 @@ def _parse_skill_file(path: Path) -> Skill:
                     description = (" ".join(parts) if fold else "\n".join(parts)).strip()
                     continue
                 description = val
-            elif stripped.startswith("allowed_tools:"):
-                inline = stripped[len("allowed_tools:"):].strip()
-                if inline.startswith("["):
-                    allowed_tools = [
-                        item.strip().strip('"').strip("'")
-                        for item in inline[1:-1].split(",")
-                        if item.strip()
-                    ]
-                elif inline:
-                    allowed_tools = [inline.strip('"').strip("'")]
-                else:
-                    j = i + 1
-                    while j < len(lines):
-                        item = lines[j].strip()
-                        if item.startswith("-"):
-                            allowed_tools.append(item[1:].strip().strip('"').strip("'"))
-                            j += 1
-                        elif not item:
-                            j += 1
-                        else:
-                            break
-                    i = j - 1
             i += 1
 
     return Skill(
         name=name,
         description=description,
         path=abs_path,
-        allowed_tools=allowed_tools,
         system_prompt_template=template,
     )
 
