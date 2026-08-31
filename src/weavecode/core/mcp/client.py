@@ -6,6 +6,8 @@ import logging
 import os
 from typing import Any
 
+import httpx
+
 log = logging.getLogger(__name__)
 
 
@@ -105,9 +107,78 @@ class _LineTransport:
             log.debug("mcp: error closing transport", exc_info=True)
 
 
+# 远程 http 传输：一次 POST 发一条 JSON-RPC 请求，响应体里就是同 id 的结果；
+# 配置里的认证请求头在建客户端时注入，带 key 的搜索类 server 才连得上
+class _HttpTransport:
+    def __init__(self, url: str, headers: dict[str, str] | None = None) -> None:
+        self._url = url
+        self._next_id = 0
+        self._client = httpx.AsyncClient(
+            headers=dict(headers) if headers else None,
+            timeout=httpx.Timeout(60.0),
+        )
+        self._closed = False
+
+    # http 连接没有常驻读循环，留出同名入口供客户端统一调度
+    async def read_loop(self) -> None:
+        return
+
+    async def request(self, method: str, params: dict[str, Any] | None = None) -> Any:
+        if self._closed:
+            raise McpServerUnavailableError("mcp: connection closed")
+        self._next_id += 1
+        payload = {
+            "jsonrpc": "2.0",
+            "id": self._next_id,
+            "method": method,
+            "params": params or {},
+        }
+        try:
+            response = await self._client.post(
+                self._url,
+                json=payload,
+                headers={"Accept": "application/json, text/event-stream"},
+            )
+        except httpx.HTTPError as exc:
+            raise McpServerUnavailableError(f"mcp: http request failed: {exc}") from exc
+        if response.status_code >= 400:
+            raise McpServerUnavailableError(f"mcp: http {response.status_code} from {self._url}")
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise McpServerUnavailableError("mcp: http response is not JSON") from exc
+        if not isinstance(data, dict):
+            raise McpServerUnavailableError("mcp: unexpected http response")
+        if isinstance(data.get("error"), dict):
+            raise McpServerUnavailableError(
+                f"mcp: {data['error'].get('message') or 'request failed'}"
+            )
+        return data.get("result")
+
+    async def notify(self, method: str, params: dict[str, Any] | None = None) -> None:
+        if self._closed:
+            raise McpServerUnavailableError("mcp: connection closed")
+        payload = {"jsonrpc": "2.0", "method": method, "params": params or {}}
+        try:
+            await self._client.post(
+                self._url,
+                json=payload,
+                headers={"Accept": "application/json, text/event-stream"},
+            )
+        except httpx.HTTPError as exc:
+            raise McpServerUnavailableError(f"mcp: http notify failed: {exc}") from exc
+
+    async def close(self) -> None:
+        self._closed = True
+        try:
+            await self._client.aclose()
+        except Exception:
+            log.debug("mcp: error closing http client", exc_info=True)
+
+
 # 手写的 MCP 客户端：握手、列工具、调用工具都在这一层完成
 class McpClient:
-    def __init__(self, transport: _LineTransport) -> None:
+    def __init__(self, transport: _LineTransport | _HttpTransport) -> None:
         self._transport = transport
         self._proc: asyncio.subprocess.Process | None = None
         self._read_task = asyncio.create_task(transport.read_loop())
@@ -146,6 +217,19 @@ class McpClient:
             raise McpServerUnavailableError(f"mcp: cannot reach {host}:{port}: {exc}") from exc
         client = cls(_LineTransport(reader, writer))
         await client.initialize()
+        return client
+
+    # 连远程 http 端点并完成握手；headers 是配置里的认证请求头
+    @classmethod
+    async def connect_http(cls, url: str, headers: dict[str, str] | None = None) -> McpClient:
+        if not url:
+            raise McpServerUnavailableError("mcp: http transport requires a url")
+        client = cls(_HttpTransport(url, headers))
+        try:
+            await client.initialize()
+        except BaseException:
+            await client.close()
+            raise
         return client
 
     # initialize 握手 + initialized 通知，之后这条连接才可用

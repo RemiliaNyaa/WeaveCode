@@ -65,6 +65,7 @@ class McpServerConfig:
     args: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
     url: str = ""             # http 专用：远程 server 端点
+    headers: dict[str, str] = field(default_factory=dict)  # http 专用：认证头
 
 
 @dataclass
@@ -264,6 +265,9 @@ def _apply_toml(config: WeaveConfig, data: dict[str, Any]) -> None:
             url = _read_str(entry, "url", "mcp.servers.url")
             if url is not None:
                 server.url = url
+            headers = _read_str_table(entry, "headers", "mcp.servers.headers")
+            if headers is not None:
+                server.headers = headers
             config.mcp.servers.append(server)
 
 
