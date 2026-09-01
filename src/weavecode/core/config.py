@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import json
 import os
-import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -13,7 +13,7 @@ _DEFAULT_PORT = 7437
 _DEFAULT_LOG_LEVEL = "INFO"
 _DEFAULT_LOG_FILE = "~/.weave/logs/core.log"
 _DEFAULT_LOG_FORMAT = "text"
-_DEFAULT_CONFIG_PATH = "~/.weave/config.toml"
+_DEFAULT_CONFIG_PATH = "~/.weave/config.json"
 _DEFAULT_MAX_STEPS = 20
 _DEFAULT_MODEL = "claude-sonnet-4-6"
 _DEFAULT_TRACE_FILE = "~/.weave/traces/daemon.jsonl"
@@ -34,7 +34,7 @@ class AgentConfig:
 @dataclass
 class LlmConfig:
     default_model: str = _DEFAULT_MODEL
-    router: str = "static"  # "static" | "rule_based" | "cost_budget"
+    router: str = "static"  # "static" | "rule_based" (S4) | "cost_budget" (S6)
 
 
 @dataclass
@@ -60,11 +60,11 @@ class CompactionConfig:
 @dataclass
 class McpServerConfig:
     name: str
-    transport: str = "stdio"  # "stdio" | "http"
-    command: str = ""         # stdio 专用：可执行文件路径
+    command: str = ""              # stdio 专用：可执行文件路径
     args: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
-    url: str = ""             # http 专用：远程 server 端点
+    cwd: str = ""                  # stdio 专用：子进程工作目录
+    url: str = ""                  # http 专用：连接端点
     headers: dict[str, str] = field(default_factory=dict)  # http 专用：认证头
 
 
@@ -86,189 +86,227 @@ class WeaveConfig:
     mcp: McpConfig = field(default_factory=McpConfig)
 
 
-# 构建并返回运行时配置：默认值 → TOML → .env → WEAVE_* 环境变量（后者优先级最高）
+# 构建并返回运行时配置：默认值 → 全局 JSON → 项目本地 JSON → .env → 系统环境变量（后者优先级最高）
 def get_config() -> WeaveConfig:
     config = WeaveConfig()
 
-    # .env 必须在读取 WEAVE_CONFIG 之前加载，以便 .env 中的 WEAVE_CONFIG 能影响 TOML 路径
+    # .env 必须在读取 WEAVE_CONFIG 之前加载，以便 .env 中的 WEAVE_CONFIG 能影响 JSON 路径
     load_dotenv(".env", override=False)
 
-    config_path = Path(os.environ.get("WEAVE_CONFIG", _DEFAULT_CONFIG_PATH)).expanduser()
-    if config_path.exists():
-        with open(config_path, "rb") as f:
-            data = tomllib.load(f)
-        _apply_toml(config, data)
+    # 若显式指定 WEAVE_CONFIG，只读该文件；否则按优先级叠加：全局 → 项目本地
+    explicit = os.environ.get("WEAVE_CONFIG")
+    if explicit:
+        config_paths = [Path(explicit).expanduser()]
+    else:
+        config_paths = [
+            Path(_DEFAULT_CONFIG_PATH).expanduser(),
+            Path(".weave/config.json"),
+        ]
+
+    for config_path in config_paths:
+        if config_path.exists():
+            try:
+                with open(config_path, "rb") as f:
+                    data = json.load(f)
+            except json.JSONDecodeError as e:
+                raise SystemExit(f"Config parse error ({config_path}): {e}") from e
+            _apply_json(config, data)
 
     _apply_env(config)
     return config
 
 
-# 取出一个小节表：缺失按空表处理，类型不符直接退出并报出小节名
-def _section(data: dict[str, Any], name: str) -> dict[str, Any]:
-    value = data.get(name)
-    if value is None:
-        return {}
-    if not isinstance(value, dict):
-        raise SystemExit(f"Config error: [{name}] must be a table")
-    return value
+# 将已解析的 JSON 根表写入 config；未知小节或类型错误时退出进程
+def _apply_json(config: WeaveConfig, data: dict[str, Any]) -> None:
+    unknown = set(data.keys()) - {"core", "logging", "agent", "llm", "trace", "permission", "compaction", "mcp"}
+    if unknown:
+        raise SystemExit(f"Unknown top-level config keys: {', '.join(sorted(unknown))}")
 
+    if "core" in data:
+        core = data["core"]
+        if not isinstance(core, dict):
+            raise SystemExit("Config error: [core] must be a table")
+        unknown_core: set[str] = set(core.keys()) - {"host", "port"}
+        if unknown_core:
+            raise SystemExit(f"Unknown [core] keys: {', '.join(sorted(unknown_core))}")
+        if "host" in core:
+            val = core["host"]
+            if not isinstance(val, str):
+                raise SystemExit("Config error: core.host must be a string")
+            config.host = val
+        if "port" in core:
+            val = core["port"]
+            if not isinstance(val, int):
+                raise SystemExit("Config error: core.port must be an integer")
+            config.port = val
 
-# 取出字符串字段：缺失返回 None，类型不符直接退出并报出键名
-def _read_str(section: dict[str, Any], key: str, path: str) -> str | None:
-    if key not in section:
-        return None
-    value = section[key]
-    if not isinstance(value, str):
-        raise SystemExit(f"Config error: {path} must be a string")
-    return value
+    if "logging" in data:
+        log = data["logging"]
+        if not isinstance(log, dict):
+            raise SystemExit("Config error: logging must be a table")
+        unknown_log: set[str] = set(log.keys()) - {"level", "file", "format"}
+        if unknown_log:
+            raise SystemExit(f"Unknown logging keys: {', '.join(sorted(unknown_log))}")
+        for key in ("level", "file", "format"):
+            if key in log:
+                val = log[key]
+                if not isinstance(val, str):
+                    raise SystemExit(f"Config error: logging.{key} must be a string")
+                setattr(config.logging, key, val)
 
+    if "agent" in data:
+        agent = data["agent"]
+        if not isinstance(agent, dict):
+            raise SystemExit("Config error: agent must be a table")
+        unknown_agent: set[str] = set(agent.keys()) - {"max_steps"}
+        if unknown_agent:
+            raise SystemExit(f"Unknown agent keys: {', '.join(sorted(unknown_agent))}")
+        if "max_steps" in agent:
+            val = agent["max_steps"]
+            if not isinstance(val, int) or val <= 0:
+                raise SystemExit("Config error: agent.max_steps must be a positive integer")
+            config.agent.max_steps = val
 
-# 取出整数字段：缺失返回 None，非整数直接退出并报出键名
-def _read_int(section: dict[str, Any], key: str, path: str) -> int | None:
-    if key not in section:
-        return None
-    value = section[key]
-    if not isinstance(value, int) or isinstance(value, bool):
-        raise SystemExit(f"Config error: {path} must be an integer")
-    return value
+    if "llm" in data:
+        llm = data["llm"]
+        if not isinstance(llm, dict):
+            raise SystemExit("Config error: llm must be a table")
+        unknown_llm: set[str] = set(llm.keys()) - {"default_model", "router"}
+        if unknown_llm:
+            raise SystemExit(f"Unknown llm keys: {', '.join(sorted(unknown_llm))}")
+        if "default_model" in llm:
+            val = llm["default_model"]
+            if not isinstance(val, str):
+                raise SystemExit("Config error: llm.default_model must be a string")
+            config.llm.default_model = val
+        if "router" in llm:
+            val = llm["router"]
+            if not isinstance(val, str):
+                raise SystemExit("Config error: llm.router must be a string")
+            config.llm.router = val
 
+    if "trace" in data:
+        trace = data["trace"]
+        if not isinstance(trace, dict):
+            raise SystemExit("Config error: trace must be a table")
+        unknown_trace: set[str] = set(trace.keys()) - {"enabled", "file", "include_llm_payload"}
+        if unknown_trace:
+            raise SystemExit(f"Unknown trace keys: {', '.join(sorted(unknown_trace))}")
+        if "enabled" in trace:
+            val = trace["enabled"]
+            if not isinstance(val, bool):
+                raise SystemExit("Config error: trace.enabled must be a boolean")
+            config.trace.enabled = val
+        if "file" in trace:
+            val = trace["file"]
+            if not isinstance(val, str):
+                raise SystemExit("Config error: trace.file must be a string")
+            config.trace.file = val
+        if "include_llm_payload" in trace:
+            val = trace["include_llm_payload"]
+            if not isinstance(val, bool):
+                raise SystemExit("Config error: trace.include_llm_payload must be a boolean")
+            config.trace.include_llm_payload = val
 
-# 取出浮点字段（整数也接受）：缺失返回 None，类型不符直接退出
-def _read_float(section: dict[str, Any], key: str, path: str) -> float | None:
-    if key not in section:
-        return None
-    value = section[key]
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
-        raise SystemExit(f"Config error: {path} must be a number")
-    return float(value)
+    if "permission" in data:
+        perm = data["permission"]
+        if not isinstance(perm, dict):
+            raise SystemExit("Config error: permission must be a table")
+        unknown_perm: set[str] = set(perm.keys()) - {"timeout_s", "persist"}
+        if unknown_perm:
+            raise SystemExit(f"Unknown permission keys: {', '.join(sorted(unknown_perm))}")
+        if "timeout_s" in perm:
+            val = perm["timeout_s"]
+            if not isinstance(val, (int, float)) or val < 0:
+                raise SystemExit("Config error: permission.timeout_s must be a non-negative number")
+            config.permission.timeout_s = float(val)
+        if "persist" in perm:
+            val = perm["persist"]
+            if not isinstance(val, bool):
+                raise SystemExit("Config error: permission.persist must be a boolean")
+            config.permission.persist = val
 
+    if "compaction" in data:
+        comp = data["compaction"]
+        if not isinstance(comp, dict):
+            raise SystemExit("Config error: compaction must be a table")
+        unknown_comp: set[str] = set(comp.keys()) - {
+            "auto_threshold", "tool_result_limit", "tool_result_keep",
+        }
+        if unknown_comp:
+            raise SystemExit(f"Unknown compaction keys: {', '.join(sorted(unknown_comp))}")
+        if "auto_threshold" in comp:
+            val = comp["auto_threshold"]
+            if not isinstance(val, (int, float)) or val < 0 or val > 1:
+                raise SystemExit("Config error: compaction.auto_threshold must be within 0~1")
+            config.compaction.auto_threshold = float(val)
+        if "tool_result_limit" in comp:
+            val = comp["tool_result_limit"]
+            if not isinstance(val, int) or val <= 0:
+                raise SystemExit("Config error: compaction.tool_result_limit must be a positive integer")
+            config.compaction.tool_result_limit = val
+        if "tool_result_keep" in comp:
+            val = comp["tool_result_keep"]
+            if not isinstance(val, int) or val <= 0:
+                raise SystemExit("Config error: compaction.tool_result_keep must be a positive integer")
+            config.compaction.tool_result_keep = val
 
-# 取出布尔字段：缺失返回 None，类型不符直接退出
-def _read_bool(section: dict[str, Any], key: str, path: str) -> bool | None:
-    if key not in section:
-        return None
-    value = section[key]
-    if not isinstance(value, bool):
-        raise SystemExit(f"Config error: {path} must be a boolean")
-    return value
-
-
-# 取出字符串列表字段：缺失返回 None，元素类型不符直接退出
-def _read_str_list(section: dict[str, Any], key: str, path: str) -> list[str] | None:
-    if key not in section:
-        return None
-    value = section[key]
-    if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
-        raise SystemExit(f"Config error: {path} must be an array of strings")
-    return list(value)
-
-
-# 取出字符串表字段：缺失返回 None，类型不符直接退出
-def _read_str_table(section: dict[str, Any], key: str, path: str) -> dict[str, str] | None:
-    if key not in section:
-        return None
-    value = section[key]
-    if not isinstance(value, dict):
-        raise SystemExit(f"Config error: {path} must be a table")
-    return {str(k): str(v) for k, v in value.items()}
-
-
-# 把 TOML 根表写入 config（只认已知小节，未知小节忽略）
-def _apply_toml(config: WeaveConfig, data: dict[str, Any]) -> None:
-    core = _section(data, "core")
-    host = _read_str(core, "host", "core.host")
-    if host is not None:
-        config.host = host
-    port = _read_int(core, "port", "core.port")
-    if port is not None:
-        config.port = port
-
-    log = _section(data, "logging")
-    level = _read_str(log, "level", "logging.level")
-    if level is not None:
-        config.logging.level = level
-    log_file = _read_str(log, "file", "logging.file")
-    if log_file is not None:
-        config.logging.file = log_file
-    log_format = _read_str(log, "format", "logging.format")
-    if log_format is not None:
-        config.logging.format = log_format
-
-    agent = _section(data, "agent")
-    max_steps = _read_int(agent, "max_steps", "agent.max_steps")
-    if max_steps is not None:
-        config.agent.max_steps = max_steps
-
-    llm = _section(data, "llm")
-    default_model = _read_str(llm, "default_model", "llm.default_model")
-    if default_model is not None:
-        config.llm.default_model = default_model
-    router = _read_str(llm, "router", "llm.router")
-    if router is not None:
-        config.llm.router = router
-
-    trace = _section(data, "trace")
-    enabled = _read_bool(trace, "enabled", "trace.enabled")
-    if enabled is not None:
-        config.trace.enabled = enabled
-    trace_file = _read_str(trace, "file", "trace.file")
-    if trace_file is not None:
-        config.trace.file = trace_file
-    payload = _read_bool(trace, "include_llm_payload", "trace.include_llm_payload")
-    if payload is not None:
-        config.trace.include_llm_payload = payload
-
-    perm = _section(data, "permission")
-    timeout_s = _read_float(perm, "timeout_s", "permission.timeout_s")
-    if timeout_s is not None:
-        config.permission.timeout_s = timeout_s
-    persist = _read_bool(perm, "persist", "permission.persist")
-    if persist is not None:
-        config.permission.persist = persist
-
-    comp = _section(data, "compaction")
-    threshold = _read_float(comp, "auto_threshold", "compaction.auto_threshold")
-    if threshold is not None:
-        config.compaction.auto_threshold = threshold
-    tool_limit = _read_int(comp, "tool_result_limit", "compaction.tool_result_limit")
-    if tool_limit is not None:
-        config.compaction.tool_result_limit = tool_limit
-    tool_keep = _read_int(comp, "tool_result_keep", "compaction.tool_result_keep")
-    if tool_keep is not None:
-        config.compaction.tool_result_keep = tool_keep
-
-    # 服务器清单：[[mcp.servers]] 数组表，命令行启动（stdio）或远程地址（http）两种形态
-    mcp = _section(data, "mcp")
-    servers_raw = mcp.get("servers")
-    if servers_raw is not None:
-        if not isinstance(servers_raw, list):
-            raise SystemExit("Config error: mcp.servers must be an array of tables")
-        for entry in servers_raw:
-            if not isinstance(entry, dict):
-                raise SystemExit("Config error: each mcp.servers entry must be a table")
-            name = entry.get("name")
-            if not isinstance(name, str) or not name:
-                raise SystemExit("Config error: each mcp.servers entry needs a non-empty name")
-            server = McpServerConfig(name=name)
-            transport = _read_str(entry, "transport", "mcp.servers.transport")
-            if transport is not None:
-                server.transport = transport
-            command = _read_str(entry, "command", "mcp.servers.command")
-            if command is not None:
-                server.command = command
-            args = _read_str_list(entry, "args", "mcp.servers.args")
-            if args is not None:
-                server.args = args
-            env = _read_str_table(entry, "env", "mcp.servers.env")
-            if env is not None:
-                server.env = env
-            url = _read_str(entry, "url", "mcp.servers.url")
-            if url is not None:
-                server.url = url
-            headers = _read_str_table(entry, "headers", "mcp.servers.headers")
-            if headers is not None:
-                server.headers = headers
-            config.mcp.servers.append(server)
+    # mcpServers：官方 JSON 格式（mcp 键下 mcpServers 字典，server 名 → 配置）
+    # 同名 server 覆盖：后读的（项目本地）直接覆盖先读的（全局），保证"项目本地覆盖全局"
+    if "mcp" in data:
+        mcp = data["mcp"]
+        if not isinstance(mcp, dict):
+            raise SystemExit("Config error: mcp must be a table")
+        unknown_mcp: set[str] = set(mcp.keys()) - {"mcpServers"}
+        if unknown_mcp:
+            raise SystemExit(f"Unknown mcp keys: {', '.join(sorted(unknown_mcp))}")
+        servers_raw = mcp.get("mcpServers", {})
+        if not isinstance(servers_raw, dict):
+            raise SystemExit("Config error: mcp.mcpServers must be an object of server configs")
+        # 项目本地（后读）的同名 server 覆盖全局（先读）的
+        if isinstance(servers_raw, dict):
+            for name, srv in servers_raw.items():
+                if not isinstance(srv, dict):
+                    raise SystemExit(f"Config error: mcp.mcpServers.{name} must be an object")
+                # 不解析 type 字段：有 url 视为 http，否则视为 stdio
+                s = McpServerConfig(name=name)
+                if "url" in srv:
+                    # http：只解析 url 和 headers
+                    val = srv["url"]
+                    if not isinstance(val, str):
+                        raise SystemExit(f"Config error: mcp.mcpServers.{name}.url must be a string")
+                    s.url = val
+                    if "headers" in srv:
+                        val = srv["headers"]
+                        if not isinstance(val, dict):
+                            raise SystemExit(f"Config error: mcp.mcpServers.{name}.headers must be a table")
+                        s.headers = {str(k): str(v) for k, v in val.items()}
+                else:
+                    # stdio：只解析 command、args、env、cwd
+                    if "command" in srv:
+                        val = srv["command"]
+                        if not isinstance(val, str):
+                            raise SystemExit(f"Config error: mcp.mcpServers.{name}.command must be a string")
+                        s.command = val
+                    if "args" in srv:
+                        val = srv["args"]
+                        if not isinstance(val, list):
+                            raise SystemExit(f"Config error: mcp.mcpServers.{name}.args must be an array")
+                        s.args = [str(a) for a in val]
+                    if "env" in srv:
+                        val = srv["env"]
+                        if not isinstance(val, dict):
+                            raise SystemExit(f"Config error: mcp.mcpServers.{name}.env must be a table")
+                        s.env = {str(k): str(v) for k, v in val.items()}
+                    if "cwd" in srv:
+                        val = srv["cwd"]
+                        if not isinstance(val, str):
+                            raise SystemExit(f"Config error: mcp.mcpServers.{name}.cwd must be a string")
+                        s.cwd = val
+                # 其他字段（type/toolSearch/alwaysLoad/timeout 等）一律忽略
+                # 同名 server：移除已存在的同名项（全局先读，项目后读 → 项目覆盖全局）
+                config.mcp.servers = [x for x in config.mcp.servers if x.name != name]
+                config.mcp.servers.append(s)
 
 
 # 用 WEAVE_* 环境变量覆盖 config 中对应字段（若变量已设置）

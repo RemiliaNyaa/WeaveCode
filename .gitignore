@@ -10,6 +10,9 @@ build/
 .ruff_cache/
 .pytest_cache/
 .vscode/
+uv.lock
 .idea/
 .DS_Store
 *.log
+.weave/config.json
+.weave/mcp_server.py

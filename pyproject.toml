@@ -16,6 +16,7 @@ dependencies = [
     "anthropic>=0.25",     # Anthropic LLM SDK（流式 + prompt caching）
     "textual>=0.75",       # 终端 UI 框架（weave-tui）
     "httpx[socks]>=0.28.1",
+    "mcp>=2",              # 官方 MCP SDK（stdio + streamable HTTP 客户端）
 ]
 
 # 安装后可在 PATH 中执行的入口：`weave` / `weave-core` / `weave-tui`
