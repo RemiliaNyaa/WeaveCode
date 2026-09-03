@@ -1,79 +1,147 @@
 from __future__ import annotations
 
+import math
+from difflib import get_close_matches
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from weavecode.core.tools.base import BaseTool, ToolResult
 
-_MAX_ENTRIES = 200           # 最多展示的条目数
-_DEFAULT_DEPTH = 2           # 默认递归深度
-_MAX_DEPTH = 4               # 允许的最大递归深度
+_PAGE_SIZE = 100              # 每页最多显示的条目数
+_SUGGEST_MAX = 3
+_SUGGEST_CUTOFF = 0.5
 
 
 class ListDirParams(BaseModel):
     model_config = ConfigDict(extra="ignore")
     path: str
-    max_depth: int = Field(default=_DEFAULT_DEPTH, ge=1, le=_MAX_DEPTH)
+    page: int = Field(default=1, ge=1)    # 页码（1-indexed）
 
 
 class ListDirTool(BaseTool):
     params_model = ListDirParams
     name = "list_dir"
     description = (
-        "List a directory tree recursively.\n"
-        "Path may be absolute or relative to the current working directory.\n"
-        f"Default depth is {_DEFAULT_DEPTH} (max {_MAX_DEPTH})."
+        "List the direct children of a directory in a flat list.\n"
+        "Path must be an absolute path to a directory.\n"
+        "Entries are shown one per line, sorted by name; directories are suffixed "
+        "with '/'.\n"
+        "Subdirectories are NOT recursed.\n"
+        f"At most {_PAGE_SIZE} entries per page; pass page=N to read later pages."
     )
     input_schema: dict[str, object] = {
         "type": "object",
         "properties": {
             "path": {
                 "type": "string",
-                "description": (
-                    "Directory path, absolute or relative to the current working directory."
-                ),
+                "description": "Absolute path to the directory (e.g. 'C:/Users/xxx/project').",
             },
-            "max_depth": {
+            "page": {
                 "type": "integer",
                 "description": (
-                    f"How deep to recurse (default {_DEFAULT_DEPTH}, max {_MAX_DEPTH})."
+                    f"Page number to view (default 1, "
+                    f"at most {_PAGE_SIZE} entries per page)."
                 ),
             },
         },
         "required": ["path"],
     }
 
-    # 树状递归展示目录：越界与否交给权限层判定，默认深度 2，按 200 条截断
+    # 平铺列出目录直接子项（每页最多 _PAGE_SIZE 条）；只支持绝对路径且必须是目录；不递归
     async def invoke(self, params: dict[str, object]) -> ToolResult:
         p = ListDirParams.model_validate(params)
+        path = Path(p.path)
 
-        root = Path(p.path)
-        if not root.is_absolute():
-            root = Path.cwd() / root
-        root = root.resolve()
+        if not path.is_absolute():
+            return ToolResult(
+                content=(
+                    f"Invalid path: {path}\n"
+                    "This tool requires an absolute path "
+                    "(e.g. 'C:/Users/xxx' or '/home/xxx')."
+                ),
+                is_error=True,
+                error_type="runtime_error",
+            )
 
-        if not root.exists():
-            raise FileNotFoundError(f"directory not found: {p.path}")
-        if not root.is_dir():
-            raise NotADirectoryError(f"not a directory: {p.path}")
-
-        lines = [f"{root}/"]
-        _render(root, "", 0, p.max_depth, lines)
-        return ToolResult(content="\n".join(lines))
+        return _list_sync(path, p.page)
 
 
-# 递归渲染目录树；条目数触顶时追加截断提示并停止
-def _render(directory: Path, prefix: str, depth: int, max_depth: int, lines: list[str]) -> None:
-    entries = sorted(directory.iterdir(), key=lambda e: e.name)
-    for index, entry in enumerate(entries):
-        if len(lines) >= _MAX_ENTRIES:
-            lines.append("...(truncated)")
-            return
-        last = index == len(entries) - 1
-        connector = "└── " if last else "├── "
+# 列目录并分页渲染
+def _list_sync(path: Path, page: int) -> ToolResult:
+    if not path.exists():
+        return ToolResult(
+            content=_missing_dir_message(path),
+            is_error=True,
+            error_type="runtime_error",
+        )
+    if not path.is_dir():
+        return ToolResult(
+            content=(
+                f"Not a directory: {path}\n"
+                "This path is a file. Use read_file to read its content."
+            ),
+            is_error=True,
+            error_type="runtime_error",
+        )
+
+    entries = sorted(path.iterdir(), key=lambda e: e.name)
+    total = len(entries)
+    total_pages = max(1, math.ceil(total / _PAGE_SIZE))
+
+    if page > total_pages:
+        return ToolResult(
+            content=(
+                f"Page {page} is out of range. "
+                f"Total {total} entries, {total_pages} page(s)."
+            ),
+            is_error=True,
+            error_type="runtime_error",
+        )
+
+    start = (page - 1) * _PAGE_SIZE
+    end = min(start + _PAGE_SIZE, total)
+    sliced = entries[start:end]
+
+    lines = [
+        f"<path>{path}</path>",
+        "<type>directory</type>",
+        "<entries>",
+    ]
+    for entry in sliced:
         suffix = "/" if entry.is_dir() else ""
-        lines.append(f"{prefix}{connector}{entry.name}{suffix}")
-        if entry.is_dir() and depth + 1 < max_depth:
-            child_prefix = prefix + ("    " if last else "│   ")
-            _render(entry, child_prefix, depth + 1, max_depth, lines)
+        lines.append(f"{entry.name}{suffix}")
+    lines.append("</entries>")
+
+    if total == 0:
+        footer = "(0 entries, page 1 of 1.)"
+    elif end < total:
+        footer = (
+            f"(Showing entries {start + 1}-{end} of {total}. "
+            f"Page {page} of {total_pages}. Use page={page + 1} to see more.)"
+        )
+    else:
+        footer = (
+            f"(Showing entries {start + 1}-{end} of {total}. "
+            f"Page {page} of {total_pages}.)"
+        )
+
+    return ToolResult(content="\n".join(lines) + "\n\n" + footer)
+
+
+# 生成"目录未找到"的错误消息；同目录下有相似目录名时附带建议（只列目录）
+def _missing_dir_message(path: Path) -> str:
+    msg = f"Directory not found: {path}"
+    directory = path.parent
+    if not directory.is_dir():
+        return msg
+    try:
+        candidates = [p.name for p in directory.iterdir() if p.is_dir()]
+    except OSError:
+        return msg
+    suggestions = get_close_matches(path.name, candidates, n=_SUGGEST_MAX, cutoff=_SUGGEST_CUTOFF)
+    if suggestions:
+        msg += "\n\nDid you mean one of these?\n" + "\n".join(
+            f"{directory / name}/" for name in suggestions
+        )
+    return msg

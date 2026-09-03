@@ -61,6 +61,16 @@ async def test_write_file_creates_and_returns_size(tmp_path: Path) -> None:
     assert target.read_text() == "hello world"
 
 
+# 功能：验证 write_file 自动创建不存在的父目录
+# 设计：路径包含两层不存在的子目录，确认写入后目录结构被创建
+@pytest.mark.asyncio
+async def test_write_file_creates_parent_dirs(tmp_path: Path) -> None:
+    target = tmp_path / "a" / "b" / "file.txt"
+    result = await WriteFileTool().invoke({"path": str(target), "content": "x"})
+    assert not result.is_error
+    assert target.exists()
+
+
 # ── list_dir ──────────────────────────────────────────────────────────────────
 
 # 功能：验证 list_dir 输出包含目录直接子项，目录加 / 后缀
@@ -75,3 +85,94 @@ async def test_list_dir_shows_files(tmp_path: Path) -> None:
     assert "foo.py" in result.content
     assert "bar.md" in result.content
     assert "subdir/" in result.content
+
+
+# 功能：验证 list_dir 平铺不递归（子目录里的内容不出现）
+# 设计：创建 child/grandchild 两层，断言只显示 child/ 而不显示孙级文件
+@pytest.mark.asyncio
+async def test_list_dir_no_recursion(tmp_path: Path) -> None:
+    child = tmp_path / "child"
+    child.mkdir()
+    grandchild = child / "grandchild"
+    grandchild.mkdir()
+    (grandchild / "deep.txt").write_text("x")
+
+    result = await ListDirTool().invoke({"path": str(tmp_path)})
+    assert not result.is_error
+    assert "child/" in result.content
+    assert "deep.txt" not in result.content
+
+
+# 功能：验证 list_dir 分页——第二页显示后续条目且提示用 page 继续
+# 设计：monkeypatch 把 _PAGE_SIZE 调成 2，创建 3 个文件，page=1 显示前 2 个并提示剩余；page=2 显示最后一个
+@pytest.mark.asyncio
+async def test_list_dir_pagination(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import weavecode.core.tools.builtin.list_dir as ld
+
+    monkeypatch.setattr(ld, "_PAGE_SIZE", 2)
+    for name in ("a.txt", "b.txt", "c.txt"):
+        (tmp_path / name).write_text("x")
+
+    r1 = await ListDirTool().invoke({"path": str(tmp_path), "page": 1})
+    assert not r1.is_error
+    assert "a.txt" in r1.content and "b.txt" in r1.content
+    assert "c.txt" not in r1.content
+    assert "Use page=2 to see more" in r1.content
+
+    r2 = await ListDirTool().invoke({"path": str(tmp_path), "page": 2})
+    assert not r2.is_error
+    assert "c.txt" in r2.content
+    assert "a.txt" not in r2.content
+
+
+# 功能：验证空目录显示 0 entries 提示
+# 设计：空目录调用，断言 content 含 "(0 entries"
+@pytest.mark.asyncio
+async def test_list_dir_empty(tmp_path: Path) -> None:
+    result = await ListDirTool().invoke({"path": str(tmp_path)})
+    assert not result.is_error
+    assert "(0 entries" in result.content
+
+
+# 功能：验证 page 越界返回错误而非崩溃
+# 设计：只有 1 个文件却请求 page=5，断言 is_error 且消息含 out of range
+@pytest.mark.asyncio
+async def test_list_dir_page_out_of_range(tmp_path: Path) -> None:
+    (tmp_path / "a.txt").write_text("x")
+    result = await ListDirTool().invoke({"path": str(tmp_path), "page": 5})
+    assert result.is_error
+    assert "out of range" in result.content
+
+
+# 功能：验证目录不存在返回错误并给相似目录建议
+# 设计：同目录下建相似目录名，断言错误消息含 Did you mean 且建议带 /
+@pytest.mark.asyncio
+async def test_list_dir_missing_dir_suggests(tmp_path: Path) -> None:
+    (tmp_path / "my_config").mkdir()
+    result = await ListDirTool().invoke({"path": str(tmp_path / "my_configs")})
+    assert result.is_error
+    assert "Directory not found" in result.content
+    assert "Did you mean" in result.content
+    assert "my_config/" in result.content
+
+
+# 功能：验证传入文件路径时报错并引导用 read_file
+# 设计：传入一个文件路径，断言 is_error 且消息含 Not a directory / read_file
+@pytest.mark.asyncio
+async def test_list_dir_file_path_rejected(tmp_path: Path) -> None:
+    f = tmp_path / "a.txt"
+    f.write_text("x")
+    result = await ListDirTool().invoke({"path": str(f)})
+    assert result.is_error
+    assert "Not a directory" in result.content
+    assert "read_file" in result.content
+
+
+# 功能：验证相对路径被拒绝（只支持绝对路径）
+# 设计：传相对路径，断言 is_error 且消息含 Invalid path / absolute
+@pytest.mark.asyncio
+async def test_list_dir_relative_path_rejected(tmp_path: Path) -> None:
+    result = await ListDirTool().invoke({"path": "subdir"})
+    assert result.is_error
+    assert "Invalid path" in result.content
+    assert "absolute path" in result.content
