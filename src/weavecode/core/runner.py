@@ -21,19 +21,18 @@ from weavecode.core.runs import RUNS_DIR, new_run_id
 from weavecode.core.session.model import Session
 from weavecode.core.session.store import SessionStore
 from weavecode.core.subagent.tool import SpawnAgentTool
-from weavecode.core.task import TaskManager
 from weavecode.core.trace.provider import TracingProvider
 from weavecode.core.trace.writer import TraceWriter
 from weavecode.core.tools.builtin import (
     BashTool,
     ListDirTool,
-    NoteSaveTool,
     ReadFileTool,
-    TaskCreateTool,
-    TaskGetTool,
-    TaskListTool,
-    TaskUpdateTool,
     WriteFileTool,
+)
+from weavecode.core.tools.builtin.update_plan import (
+    FilePlanStorage,
+    PlanStorage,
+    UpdatePlanTool,
 )
 from weavecode.core.tools.registry import ToolRegistry
 
@@ -93,19 +92,17 @@ class AgentRunner:
         run_id: str | None = None,
         session: Session | None = None,
         store: SessionStore | None = None,
-        task_manager: TaskManager | None = None,
+        plan_storage: PlanStorage | None = None,
     ) -> RunOutcome:
         run_id = run_id or new_run_id()
         # 有会话时读回整段历史并挂到会话的运行目录下，否则从 goal 起一份全新历史
         if session is not None and store is not None:
             run_path = store.runs_dir(session.id) / run_id
             history = store.read_messages(session.id)
-            notes = store.read_notes(session.id)
             session_dir = store.session_dir(session.id)
         else:
             run_path = self._runs_dir / run_id
             history = [{"role": "user", "content": goal}]
-            notes = ""
             session_dir = run_path
         run_path.mkdir(parents=True, exist_ok=True)
 
@@ -124,14 +121,13 @@ class AgentRunner:
             goal=goal,
             max_steps=self._config.agent.max_steps,
             prefill_messages=history,
-            session_notes=notes,
             global_context=global_ctx,
             project_context=project_ctx,
         )
 
-        # 任务归属会话：调用方注入实例时跨 run 复用，否则按会话目录兜底
-        if task_manager is None:
-            task_manager = TaskManager(session_dir / ".tasks")
+        # 计划存储：调用方注入时跨 run 复用同一份；否则全量覆盖写进本次会话的任务目录
+        if plan_storage is None:
+            plan_storage = FilePlanStorage(session_dir / ".tasks")
         session_id = session.id if session is not None else ""
 
         # 事件文件用 async with 打开：无论正常结束、报错还是被中断都会正确关闭
@@ -152,19 +148,17 @@ class AgentRunner:
                         include_payload=self._config.trace.include_llm_payload,
                     )
                 registry = self._build_registry(
-                    task_manager,
+                    plan_storage,
                     run_id=run_id,
                     provider=provider,
                     bus=bus,
-                    session=session,
-                    store=store,
+                    session_id=session_id,
                 )
                 compactor = Compactor(bus, session_dir=session_dir)
                 loop = AgentLoop(
                     provider,
                     registry,
                     bus,
-                    tasks=task_manager,
                     session_id=session_id,
                     permission_manager=self._permission_manager,
                     compactor=compactor,
@@ -200,30 +194,20 @@ class AgentRunner:
             reason=context.reason,
         )
 
-    # 构建本次运行的工具注册表：内置文件工具 + 任务工具 + 外部工具服务器的工具
+    # 构建本次运行的工具注册表：内置文件工具 + 计划工具 + 外部工具服务器的工具
     def _build_registry(
         self,
-        task_manager: TaskManager,
+        plan_storage: PlanStorage,
         *,
         run_id: str | None = None,
         provider: LLMProvider | None = None,
         bus: EventBus | None = None,
-        session: Session | None = None,
-        store: SessionStore | None = None,
+        session_id: str = "",
     ) -> ToolRegistry:
         registry = ToolRegistry()
         for t in [ReadFileTool(), BashTool(), WriteFileTool(), ListDirTool()]:
             registry.register(t)
-        for t in [
-            TaskCreateTool(task_manager),
-            TaskUpdateTool(task_manager),
-            TaskListTool(task_manager),
-            TaskGetTool(task_manager),
-        ]:
-            registry.register(t)
-        # 笔记工具只在 session run 里注册：没有 session 就没有写入目标
-        if session is not None and store is not None and run_id is not None:
-            registry.register(NoteSaveTool(store, session.id, run_id))
+        registry.register(UpdatePlanTool(plan_storage))
 
         mcp_tools = self._mcp_manager.get_tools() if self._mcp_manager is not None else []
 
@@ -236,7 +220,7 @@ class AgentRunner:
                     parent_run_id=run_id,
                     permission_manager=self._permission_manager,
                     max_steps=self._config.agent.max_steps,
-                    session_id=session.id if session is not None else "",
+                    session_id=session_id,
                     runs_dir=self._runs_dir,
                 )
             )
