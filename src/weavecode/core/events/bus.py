@@ -4,7 +4,7 @@ from collections.abc import Awaitable, Callable
 
 from pydantic import BaseModel
 
-EventHandler = Callable[[BaseModel], Awaitable[None]]
+type EventHandler = Callable[[BaseModel], Awaitable[None]]
 
 
 class EventBus:
@@ -15,6 +15,7 @@ class EventBus:
     def subscribe(self, handler: EventHandler) -> None:
         self._subscribers.append(handler)
 
+    # 按注册顺序依次调用所有订阅者
     async def publish(self, event: BaseModel) -> None:
         for handler in self._subscribers:
             await handler(event)

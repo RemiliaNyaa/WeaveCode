@@ -8,7 +8,6 @@ import pytest
 
 from weavecode.core.events.bus import EventBus
 from weavecode.core.llm.types import LlmResponse, UsageStats
-from weavecode.core.subagent.registry import BackgroundTaskRegistry
 from weavecode.core.subagent.tool import SpawnAgentTool
 
 
@@ -44,8 +43,6 @@ def _make_tool(
         max_steps=5,
         session_id="sess-test",
         runs_dir=tmp_path / "runs",
-        task_registry=BackgroundTaskRegistry(),
-        depth=0,
     )
     return tool, bus
 

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -14,7 +13,6 @@ from weavecode.core.events.bus import EventBus
 from weavecode.core.events.writer import EventWriter
 from weavecode.core.loop import AgentLoop
 from weavecode.core.runs import new_run_id
-from weavecode.core.subagent.registry import BackgroundTaskRegistry
 from weavecode.core.tools.base import BaseTool, ToolResult
 from weavecode.core.tools.builtin import BashTool, ListDirTool, ReadFileTool, WriteFileTool
 from weavecode.core.tools.registry import ToolRegistry
@@ -31,13 +29,11 @@ def _now() -> str:
 class SpawnAgentParams(BaseModel):
     description: str
     prompt: str
-    # 后台派生：立即拿到 run_id，稍后用 agent_result 取结果
-    run_in_background: bool = False
     # 角色名：按角色配置加载系统提示与工具白名单，留空用主 Agent 的默认提示
     subagent_type: str = ""
 
 
-# 在隔离的冷启动上下文中派生子 agent；默认阻塞等结果
+# 在隔离的冷启动上下文中派生子 agent，恒阻塞等结果
 class SpawnAgentTool(BaseTool):
     name = "spawn_agent"
     description = (
@@ -54,16 +50,13 @@ class SpawnAgentTool(BaseTool):
         "in the main thread or pass ALL needed context explicitly in prompt.\n"
         "\n"
         "Rules:\n"
-        "- By default this tool BLOCKS: it waits for the sub-agent to finish and the "
-        "result is returned inline as the tool output.\n"
-        "- Set run_in_background=true to start the sub-agent without waiting: the call "
-        "returns immediately with a run_id, and you collect the result later with "
-        "agent_result(run_id=...).\n"
-        "- subagent_type picks the role profile (its own system prompt and tool "
-        "whitelist). Use it to get a read-only planner or reviewer.\n"
+        "- This tool BLOCKS: it waits for the sub-agent to finish, and the result comes "
+        "back inline as the tool output.\n"
         "- To run several sub-agents in parallel, issue MULTIPLE spawn_agent tool calls "
         "in a single tool-calling step (one call per sub-task). The system executes them "
         "concurrently. Do NOT wait for one to finish before issuing the next.\n"
+        "- subagent_type picks the role profile (its own system prompt and tool "
+        "whitelist). Use it to get a read-only planner or reviewer.\n"
         "- The sub-agent starts with a clean context containing ONLY the provided prompt "
         "- it does NOT inherit the current conversation history. Be explicit and "
         "self-contained in prompt.\n"
@@ -83,13 +76,6 @@ class SpawnAgentTool(BaseTool):
                 "description": (
                     "Complete task description including all context the sub-agent needs. "
                     "The sub-agent cannot see the parent conversation, so be explicit."
-                ),
-            },
-            "run_in_background": {
-                "type": "boolean",
-                "description": (
-                    "Start the sub-agent without waiting and return a run_id immediately "
-                    "(collect the result later with agent_result). Defaults to false."
                 ),
             },
             "subagent_type": {
@@ -114,7 +100,6 @@ class SpawnAgentTool(BaseTool):
         max_steps: int,
         session_id: str,
         runs_dir: Path,
-        task_registry: BackgroundTaskRegistry,
     ) -> None:
         self._provider = provider
         self._parent_bus = parent_bus
@@ -123,10 +108,9 @@ class SpawnAgentTool(BaseTool):
         self._max_steps = max_steps
         self._session_id = session_id
         self._runs_dir = runs_dir
-        self._task_registry = task_registry
         self._profile_loader = AgentProfileLoader()
 
-    # 派生子 agent：默认阻塞等结果，run_in_background=true 时登记后台任务并立即返回 run_id
+    # 派生子 agent 并等它跑完，结果作为工具输出返回
     async def invoke(self, params: dict[str, object]) -> ToolResult:
         p = SpawnAgentParams.model_validate(params)
         profile = self._profile_loader.resolve(p.subagent_type) if p.subagent_type else None
@@ -137,15 +121,6 @@ class SpawnAgentTool(BaseTool):
             max_steps=self._max_steps,
             system_prompt_override=profile.system_prompt if profile else None,
         )
-        if p.run_in_background:
-            task = asyncio.create_task(self._run_child(child_run_id, child_context, p, profile))
-            self._task_registry.register(child_run_id, task, child_context)
-            return ToolResult(
-                content=(
-                    f"Subagent started in background. run_id={child_run_id}. "
-                    f"Use agent_result(run_id='{child_run_id}') to retrieve result."
-                )
-            )
         return await self._run_child(child_run_id, child_context, p, profile)
 
     # 跑一个子 Agent：冷启动上下文 + 事件桥接 + 写事件文件，返回它的结果
