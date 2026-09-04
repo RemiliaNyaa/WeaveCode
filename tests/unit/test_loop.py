@@ -63,6 +63,32 @@ class _FailTool(BaseTool):
         raise RuntimeError("tool error")
 
 
+class _GatedTool(BaseTool):
+    """按 msg 名注册的闸门工具：先等自己名字的 Event，再写一条执行记录。
+
+    用来验证多个工具调用是否被并行执行——若串行，第一个工具会等第二个的
+    Event 而互相死锁；并行则两边同时启动、互不等待。
+    """
+
+    name = "gated"
+    description = "Gates on an event by msg"
+    input_schema: dict[str, object] = {
+        "type": "object",
+        "properties": {"msg": {"type": "string"}},
+        "required": ["msg"],
+    }
+
+    def __init__(self, events: dict[str, asyncio.Event], started: list[str]) -> None:
+        self._events = events
+        self._started = started
+
+    async def invoke(self, params: dict[str, object]) -> ToolResult:
+        msg = str(params["msg"])
+        self._started.append(msg)
+        await self._events[msg].wait()
+        return ToolResult(content=f"done:{msg}")
+
+
 # --- helpers -----------------------------------------------------------------
 
 
@@ -290,3 +316,37 @@ async def test_assistant_message_blocks_added_to_context() -> None:
 # 设计：两个闸门工具各自等自己的 Event——串行实现会因第一个工具等第二个的 Event 而互相死锁，
 #       并行实现则两边同时启动、互不等待；先 set 一个 Event，等全部 started 后 set 另一个，
 #       若为并行则第一个工具在等自己 Event 时第二个工具已启动（started 含两者）
+
+# 功能：验证同一轮多个工具调用被并行执行（而非串行逐个等待）
+# 设计：两个闸门工具各自等自己的 Event——串行实现会因第一个工具等第二个的 Event 而互相死锁，
+#       并行实现则两边同时启动、互不等待；先 set 一个 Event，等全部 started 后 set 另一个，
+#       若为并行则第一个工具在等自己 Event 时第二个工具已启动（started 含两者）
+async def test_multiple_tool_calls_execute_in_parallel() -> None:
+    ev_a = asyncio.Event()
+    ev_b = asyncio.Event()
+    started: list[str] = []
+    gate = _GatedTool({"a": ev_a, "b": ev_b}, started)
+
+    provider = _MockProvider([
+        LlmResponse(
+            stop_reason="tool_use",
+            tool_calls=[
+                _tc("gated", {"msg": "a"}, uid="t-a"),
+                _tc("gated", {"msg": "b"}, uid="t-b"),
+            ],
+        ),
+        LlmResponse(stop_reason="end_turn", text="done"),
+    ])
+    registry = ToolRegistry()
+    registry.register(gate)
+    loop, _ = _make_loop(provider, registry)
+    ctx = _ctx()
+
+    run_task = asyncio.create_task(loop.run(ctx))
+    await asyncio.sleep(0.05)  # 让两个工具都进入 invoke
+    # 并行下：两个都已在 started（互相不等）；串行下：只有第一个进 started，正卡在等 b 的 Event
+    assert set(started) == {"a", "b"}, f"expected both started in parallel, got {started}"
+    ev_a.set()
+    ev_b.set()
+    await run_task
+    assert ctx.status == "success"

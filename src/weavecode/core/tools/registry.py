@@ -7,20 +7,10 @@ from weavecode.core.tools.base import BaseTool
 class ToolRegistry:
     def __init__(self) -> None:
         self._tools: dict[str, BaseTool] = {}
-        # 已注册工具的 schema 列表缓存：注册时重建，导出时直接交出本体
-        self._schemas: list[dict[str, object]] = []
 
     # 注册工具；同名覆盖
     def register(self, tool: BaseTool) -> None:
         self._tools[tool.name] = tool
-        self._schemas = [
-            {
-                "name": item.name,
-                "description": item.description,
-                "input_schema": item.input_schema,
-            }
-            for item in self._tools.values()
-        ]
 
     # 按名称查找工具，不存在返回 None
     def get(self, name: str) -> BaseTool | None:
@@ -31,5 +21,13 @@ class ToolRegistry:
         return list(self._tools)
 
     # 返回所有工具的 Anthropic 格式 schema 列表
+    # 每次现场构造一份注册快照：调用方拿到的列表与注册表脱钩，导出与注册互不干扰
     def tool_schemas(self) -> list[dict[str, object]]:
-        return self._schemas
+        return [
+            {
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": tool.input_schema,
+            }
+            for tool in self._tools.values()
+        ]

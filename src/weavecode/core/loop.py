@@ -9,23 +9,17 @@ from weavecode.core.bus.events import StepFinishedEvent, StepStartedEvent
 from weavecode.core.context import ExecutionContext
 from weavecode.core.events.bus import EventBus
 from weavecode.core.llm.base import LLMProvider
-from weavecode.core.llm.provider import truncate_tool_results
+from weavecode.core.llm.provider import _SYSTEM_PROMPT, truncate_tool_results
 from weavecode.core.llm.types import UsageStats
 from weavecode.core.tools.invocation import invoke_tool
 from weavecode.core.tools.registry import ToolRegistry
 
 if TYPE_CHECKING:
     from weavecode.core.compact.compactor import Compactor
-    from weavecode.core.task import TaskManager
 
 log = logging.getLogger(__name__)
 
-# 系统提示词基础段：交给 context 统一拼装，循环只持有这一份文本
-_SYSTEM_PROMPT = (
-    "You are Weave, a terminal AI assistant. Take small, concrete steps toward the "
-    "user's goal, act with the available tools, observe what happens after every "
-    "action, and keep going until the goal is reached."
-)
+# 系统提示词基础段由 provider 持有，循环直接导入复用，避免同一份文本出现两处拷贝
 
 # 终止条件只有三条：
 #   LLM 返回 end_turn            → success
@@ -42,14 +36,13 @@ def _now() -> str:
 
 
 class AgentLoop:
-    # 初始化循环所需依赖：LLM provider、工具注册表、事件总线与任务管理器
+    # 初始化循环所需依赖：LLM provider、工具注册表、事件总线，以及可选的会话与压缩依赖
     def __init__(
         self,
         provider: LLMProvider,
         registry: ToolRegistry,
         bus: EventBus,
         *,
-        tasks: TaskManager | None = None,
         session_id: str = "",
         permission_manager: Any = None,
         compactor: Compactor | None = None,
@@ -57,8 +50,6 @@ class AgentLoop:
         self._provider = provider
         self._registry = registry
         self._bus = bus
-        # 任务状态由 runner 注入，循环每一步读一次并带给模型与工具链
-        self._tasks = tasks
         # 会话标识与权限管理器由 runner 注入，工具调用前先过审批
         self._session_id = session_id
         self._permission_manager = permission_manager
@@ -66,16 +57,6 @@ class AgentLoop:
         self._compactor = compactor
         # 上一轮请求的用量，水位判据用它来决定要不要压缩
         self._last_usage: UsageStats | None = None
-
-    # 把当前任务状态拼进 system prompt：模型每一步都能看到清单走到哪了
-    def _task_section(self, system: str) -> str:
-        if self._tasks is None:
-            return system
-        tasks = self._tasks.list()
-        if not tasks:
-            return system
-        lines = [f"- [{task.status}] {task.subject}" for task in tasks]
-        return system + "\n\n## Tasks\n" + "\n".join(lines)
 
     # 驱动 think → tool → observe 闭环，直到模型收工或步数用尽
     async def run(self, context: ExecutionContext) -> None:
@@ -96,7 +77,7 @@ class AgentLoop:
                     bus=self._bus,
                     run_id=context.run_id,
                     step=context.step,
-                    system=self._task_section(context.system_prompt(_SYSTEM_PROMPT)),
+                    system=context.system_prompt(_SYSTEM_PROMPT),
                 )
             except asyncio.CancelledError:
                 # 必须向上传播，让上层有机会在文件关闭后收尾
@@ -136,10 +117,16 @@ class AgentLoop:
                         "permission_manager": self._permission_manager,
                         "session_id": self._session_id,
                     }
-                for tc in response.tool_calls:
-                    result = await invoke_tool(
-                        self._registry, tc, self._bus, context.run_id, **invoke_extra
-                    )
+                # 并发执行本轮所有工具调用；gather 按传入顺序返回，结果与调用一一配对
+                results = await asyncio.gather(
+                    *[
+                        invoke_tool(
+                            self._registry, tc, self._bus, context.run_id, **invoke_extra
+                        )
+                        for tc in response.tool_calls
+                    ]
+                )
+                for tc, result in zip(response.tool_calls, results):
                     context.add_tool_result(tc.id, result.content, is_error=result.is_error)
             elif response.stop_reason == "max_tokens" and response.tool_calls:
                 # 输出被 token 上限截断，工具调用只有半截：补一条错误结果保持配对完整
