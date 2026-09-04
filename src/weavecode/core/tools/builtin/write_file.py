@@ -20,11 +20,21 @@ class WriteFileTool(BaseTool):
     name = "write_file"
     description = (
         "Write text content to a file (create or fully replace).\n"
-        "Path must be absolute. Parent directories are created automatically.\n"
-        "If the file already exists, its entire content is replaced - this is "
-        "destructive. Before overwriting, use read_file to inspect the current "
-        "content (skip only if you already know it).\n"
-        "Content size is limited to 1 MB."
+        "\n"
+        "When to use:\n"
+        "- Creating a new file.\n"
+        "- Replacing the entire content of an existing file.\n"
+        "\n"
+        "When NOT to use:\n"
+        "- Making a small change inside an existing file - use edit_file.\n"
+        "- Appending to a file - not supported; read the file, then rewrite the full content.\n"
+        "\n"
+        "Rules:\n"
+        "- Path must be absolute. Parent directories are created automatically.\n"
+        "- If the file already exists, its entire content is replaced - this is "
+        "destructive. Before overwriting, use list_dir to confirm it exists and "
+        "read_file to inspect the current content (skip only if you already know it).\n"
+        "- Content size is limited to 1 MB."
     )
     input_schema: dict[str, object] = {
         "type": "object",

@@ -5,16 +5,6 @@ from typing import Any
 
 from weavecode.core.skills.loader import SkillLoader
 
-# 工具使用说明：静态文本，拼在基础段之后一起构成可缓存的前缀
-_TOOL_USAGE = (
-    "## Tools\n"
-    "- Prefer the dedicated file tools over shell commands when reading or writing "
-    "files; bash is for running system commands.\n"
-    "- Give every tool call one clear purpose, and look at its result before the "
-    "next step.\n"
-    "- Pass absolute paths to file tools whenever the target location is known.\n"
-)
-
 
 @dataclass
 class ExecutionContext:
@@ -41,11 +31,10 @@ class ExecutionContext:
         elif not self.messages:
             self.messages.append({"role": "user", "content": self.goal})
 
-    # 返回本次运行的 system prompt：基础段 + 工具使用说明 + 三层上下文 + 技能清单
-    # 静态文本排在前面、动态内容排在后面，稳定的前缀才能吃到 prompt caching
+    # 返回本次运行的 system prompt：基础段 + 三层上下文 + 技能清单
+    # 基础段由循环传入（角色与使用策略的单一事实来源），本函数只负责分层拼接
     def system_prompt(self, base: str) -> str:
         parts = [base]
-        parts.append("\n\n" + _TOOL_USAGE)
         if self.global_context.strip():
             parts.append("\n\n## Global Context\n" + self.global_context.strip())
         if self.project_context.strip():

@@ -18,13 +18,24 @@ class EditFileTool(BaseTool):
     params_model = EditFileParams
     name = "edit_file"
     description = (
-        "Replace an exact substring in a file.\n"
-        "Path must be absolute.\n"
-        "old_string must match the file content exactly, including spaces, "
+        "Replace an exact substring in an existing file.\n"
+        "\n"
+        "When to use:\n"
+        "- Making a targeted change to a specific part of an existing file.\n"
+        "- Fixing a small bug, renaming, or updating one line/block.\n"
+        "\n"
+        "When NOT to use:\n"
+        "- Creating a new file or replacing the whole file - use write_file.\n"
+        "- You do not know the current content - read the file first.\n"
+        "\n"
+        "Rules:\n"
+        "- Path must be absolute.\n"
+        "- old_string must match the file content exactly, including spaces, "
         "indentation, and line endings.\n"
-        "If old_string matches multiple locations, only the first is replaced and "
-        "the result reports the total count.\n"
-        "This tool only modifies existing files."
+        "- If old_string matches multiple locations, only the first is replaced and the "
+        "result reports the total count - pass an old_string that matches uniquely "
+        "(add surrounding context if needed).\n"
+        "- This tool only modifies existing files."
     )
     input_schema: dict[str, object] = {
         "type": "object",

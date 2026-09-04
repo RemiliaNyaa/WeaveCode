@@ -24,11 +24,21 @@ class ListDirTool(BaseTool):
     name = "list_dir"
     description = (
         "List the direct children of a directory in a flat list.\n"
-        "Path must be an absolute path to a directory.\n"
-        "Entries are shown one per line, sorted by name; directories are suffixed "
-        "with '/'.\n"
-        "Subdirectories are NOT recursed.\n"
-        f"At most {_PAGE_SIZE} entries per page; pass page=N to read later pages."
+        "\n"
+        "When to use:\n"
+        "- You need to discover what files/directories exist under a path.\n"
+        "- You need to verify whether a file exists before writing over it.\n"
+        "\n"
+        "When NOT to use:\n"
+        "- You need the content of a file - use read_file.\n"
+        "- You need to traverse a whole tree recursively - list the relevant "
+        "directory and drill into subdirectories by name.\n"
+        "\n"
+        "Rules:\n"
+        "- Path must be an absolute path to a directory.\n"
+        "- Entries are shown one per line, sorted by name; directories are suffixed with '/'.\n"
+        "- Subdirectories are NOT recursed.\n"
+        f"- At most {_PAGE_SIZE} entries per page; pass page=N to read later pages."
     )
     input_schema: dict[str, object] = {
         "type": "object",

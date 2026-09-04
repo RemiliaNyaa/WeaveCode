@@ -44,10 +44,21 @@ class ReadFileTool(BaseTool):
     params_model = ReadFileParams
     name = "read_file"
     description = (
-        "Read the text content of a file, with line numbers.\n"
-        "Path must be absolute (e.g. 'C:/Users/xxx/file.txt').\n"
-        "Reads up to 2000 lines / 50 KB per call; use offset to page through a "
-        "large file."
+        "Read the text content of a file.\n"
+        "\n"
+        "When to use:\n"
+        "- You need to inspect the content of a file (source code, config, notes).\n"
+        "- You need to verify what a previous edit actually produced.\n"
+        "\n"
+        "When NOT to use:\n"
+        "- You only need to see what files exist - use list_dir.\n"
+        "- The file is a directory - use list_dir instead.\n"
+        "\n"
+        "Rules:\n"
+        "- Path must be absolute (e.g. 'C:/Users/xxx/file.txt').\n"
+        "- Reads up to 2000 lines / 50 KB per call; use offset to read later sections.\n"
+        "- Each line is prefixed with its line number. Use offset=1, limit=N to read "
+        "the first N lines; increase offset to page through a large file."
     )
     input_schema: dict[str, object] = {
         "type": "object",

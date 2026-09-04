@@ -21,8 +21,24 @@ class BashTool(BaseTool):
     name = "bash"
     description = (
         "Execute a shell command and return its output (stdout + stderr combined).\n"
-        "Output is truncated at 64 KB.\n"
-        "Timeout defaults to 60 seconds, max 120."
+        "\n"
+        "When to use:\n"
+        "- Running git commands, tests, package managers, or build steps.\n"
+        "- System-level operations that have no dedicated tool (e.g. checking versions, "
+        "running scripts, listing processes).\n"
+        "\n"
+        "When NOT to use:\n"
+        "- Reading a file - use read_file.\n"
+        "- Listing a directory - use list_dir.\n"
+        "- Writing/editing a file - use write_file / edit_file.\n"
+        "- Commands that require interactive input - they will hang and time out.\n"
+        "\n"
+        "Rules:\n"
+        "- Prefer short, focused commands.\n"
+        "- Non-interactive only; never chain commands that need prompts.\n"
+        "- Output is truncated at 64 KB. For large outputs, prefer dedicated tools or "
+        "redirect to a file and read it with read_file.\n"
+        "- Timeout defaults to 60 seconds, max 120."
     )
     input_schema: dict[str, object] = {
         "type": "object",
@@ -66,9 +82,7 @@ class BashTool(BaseTool):
         except Exception as exc:
             return ToolResult(content=str(exc), is_error=True, error_type="runtime_error")
 
-        # 容错解码：坏字节用替换字符兜底；子进程输出的 CRLF 统一成 \n
-        output = stdout_bytes.decode("utf-8", errors="replace").replace("\r\n", "\n")
-
+        output = stdout_bytes.decode("utf-8", errors="replace")
         truncated = len(stdout_bytes) > _MAX_OUTPUT_BYTES
         if truncated:
             output = output[:_MAX_OUTPUT_BYTES] + "\n[truncated]"
