@@ -41,8 +41,7 @@ def _now() -> str:
 def get_connection_writer() -> asyncio.StreamWriter:
     return _writer_var.get()
 
-
-_MAX_LINE_BYTES = 1024 * 1024  # 单行帧上限 1 MB，防止异常客户端把内存顶爆
+_MAX_LINE_BYTES = 64 * 1024 * 1024  # 64 MB per frame，兼容 MCP 大文件工具结果
 
 
 class SocketServer:
@@ -59,29 +58,54 @@ class SocketServer:
         self._server: asyncio.AbstractServer | None = None
         self._broadcaster = broadcaster
         self._trace = trace
+        self._active_writers: set[asyncio.StreamWriter] = set()
 
     # 注册一个方法名对应的命令处理函数
     def register(self, method: str, handler: CommandHandler) -> None:
         self._handlers[method] = handler
 
-    # 启动 TCP 服务器，返回实际监听地址
+    # 启动 TCP 服务器；若端口已被占用或无法绑定则退出进程并给出可操作的提示
     async def start(self) -> str:
-        self._server = await asyncio.start_server(
-            self._handle_connection,
-            host=self._host,
-            port=self._port,
-            limit=_MAX_LINE_BYTES,
-        )
+        try:
+            _r, w = await asyncio.open_connection(self._host, self._port)
+            w.close()
+            await w.wait_closed()
+            raise SystemExit(f"core already running at {self._host}:{self._port}")
+        except (ConnectionRefusedError, OSError):
+            pass
+
+        try:
+            self._server = await asyncio.start_server(
+                self._handle_connection,
+                host=self._host,
+                port=self._port,
+                limit=_MAX_LINE_BYTES,
+            )
+        except OSError as e:
+            # 绑定失败（端口被其他程序占用，或被系统保留段占用，如 Windows 的 Hyper-V/WSL）
+            raise SystemExit(
+                f"failed to bind {self._host}:{self._port} ({e}). "
+                f"The port may be in use, or reserved by the OS. "
+                f"Try another port, e.g. set WEAVE_PORT=8899 and retry."
+            ) from e
         return f"{self._host}:{self._port}"
 
-    # 关闭服务器
+    # 关闭服务器：先断开所有活跃连接，再等待服务器完全关闭（最多 2 秒）
     async def stop(self) -> None:
         if self._server is None:
             return
+        for writer in list(self._active_writers):
+            try:
+                writer.close()
+            except Exception:
+                pass
         self._server.close()
-        await self._server.wait_closed()
+        try:
+            await asyncio.wait_for(self._server.wait_closed(), timeout=2.0)
+        except (TimeoutError, asyncio.CancelledError):
+            pass
 
-    # 处理单个客户端连接，完成后清理该连接的订阅与写流
+    # 处理单个客户端连接，完成后关闭写流
     async def _handle_connection(
         self,
         reader: asyncio.StreamReader,
@@ -89,9 +113,11 @@ class SocketServer:
     ) -> None:
         peer = writer.get_extra_info("peername", "<unknown>")
         logger.debug("client connected: %s", peer)
+        self._active_writers.add(writer)
         try:
             await self._read_loop(reader, writer)
         finally:
+            self._active_writers.discard(writer)
             if self._broadcaster is not None:
                 self._broadcaster.unsubscribe(writer)
             try:
