@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import platform
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from weavecode.core.skills.loader import SkillLoader
@@ -23,6 +25,12 @@ class ExecutionContext:
     status: str = "running"  # "running" | "success" | "failed"
     reason: str | None = None
     result: str = ""
+    # 本会话工作目录（客户端启动目录的绝对路径）；空串回退到进程 cwd
+    working_dir: str = ""
+
+    # 返回本次运行实际生效的工作目录绝对路径
+    def effective_working_dir(self) -> str:
+        return self.working_dir or str(Path.cwd())
 
     # 初始化消息历史，优先使用调用方注入的完整历史
     def __post_init__(self) -> None:
@@ -31,10 +39,17 @@ class ExecutionContext:
         elif not self.messages:
             self.messages.append({"role": "user", "content": self.goal})
 
-    # 返回本次运行的 system prompt：基础段 + 三层上下文 + 技能清单
+    # 返回本次运行的 system prompt：基础段 + 环境信息 + 三层上下文 + 技能清单
     # 基础段由循环传入（角色与使用策略的单一事实来源），本函数只负责分层拼接
     def system_prompt(self, base: str) -> str:
         parts = [base]
+        # 运行环境每次组装时现算：工作目录与系统类型是现场事实
+        parts.append(
+            "\n\n<env>\n"
+            f"  Working directory: {self.effective_working_dir()}\n"
+            f"  Platform: {platform.system()}\n"
+            "</env>"
+        )
         if self.global_context.strip():
             parts.append("\n\n## Global Context\n" + self.global_context.strip())
         if self.project_context.strip():
