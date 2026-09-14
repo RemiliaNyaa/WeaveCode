@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from typing import Any
 
-from weavecode.core.permissions.manager import PermissionManager
+from weavecode.core.permissions.manager import EXTERNAL_DIRECTORY, PermissionManager
+from weavecode.core.permissions.paths import approval_dir, extract_paths, is_within
 from weavecode.core.permissions.policy import (
     DEFAULT_POLICIES,
     PermissionDecision,
@@ -36,7 +38,7 @@ async def _collect_emitted() -> tuple[list[dict[str, Any]], Any]:
     return emitted, emitter
 
 
-# ── evaluate 委托 ─────────────────────────────────────────────────────────────
+# ── evaluate 委托与 hard/soft 纯函数 ─────────────────────────────────────────
 
 # 功能：验证默认策略（DEFAULT_POLICIES）与 evaluate 委托
 # 设计：只读工具默认放行、影响外部世界的操作默认询问；未登记工具走 ASK 兜底
@@ -49,14 +51,13 @@ def test_evaluate_delegates_to_policy() -> None:
     assert mgr.evaluate("exa__web_search", {"query": "x"}) == PermissionDecision.ASK
 
 
-
-# 功能：验证 evaluate_hard 处理危险命令黑名单（越界此时仍在硬规则内）
-# 设计：危险命令返回 ASK；普通命令返回 None；非 bash 无硬规则
+# 功能：验证 evaluate_hard 只处理危险命令黑名单；越界走路径提取层 + external_directory
+# 设计：危险命令返回 ASK；普通命令 / 绝对路径命令返回 None；非 bash 无硬规则
 def test_evaluate_hard_dangerous_only() -> None:
     bash = ToolPolicy(default=PermissionDecision.ALLOW)
     assert evaluate_hard("bash", {"command": "ls"}, bash) is None
     assert evaluate_hard("bash", {"command": "rm -rf /"}, bash) == PermissionDecision.ASK
-    assert evaluate_hard("bash", {"command": "cat /etc/hosts"}, bash) == PermissionDecision.ASK
+    assert evaluate_hard("bash", {"command": "cat /etc/hosts"}, bash) is None  # 越界不走 hard
     assert evaluate_hard("read_file", {"path": "/etc/hosts"}, bash) is None  # 非 bash 无硬规则
 
 
@@ -67,22 +68,52 @@ def test_evaluate_soft_returns_default() -> None:
     assert evaluate_soft("bash", {"command": "cat x"}, ToolPolicy(default=PermissionDecision.ASK)) == PermissionDecision.ASK
     assert evaluate_soft("read_file", {"path": "x"}, ToolPolicy(default=PermissionDecision.ALLOW)) == PermissionDecision.ALLOW
 
+
+# ── paths 工具函数 ───────────────────────────────────────────────────────────
+
+# 功能：验证 is_within 区分目录内外的路径
+# 设计：覆盖「同路径」「子路径」「父路径」「兄弟目录」「跨盘符」四类边界
+def test_is_within_paths() -> None:
+    root = "/proj"
+    assert is_within("/proj/a.py", root) is True
+    assert is_within("/proj/sub/a.py", root) is True
+    assert is_within("/proj", root) is True
+    assert is_within("/other/a.py", root) is False
+    assert is_within("/proj2/a.py", root) is False  # 前缀相似但不是子目录
+
+
+# 功能：验证 extract_paths 从工具参数中提取路径并归一化
+# 设计：path 键命中；相对路径按工作目录补全；无路径参数的工具返回空
+def test_extract_paths() -> None:
+    assert extract_paths("read_file", {"path": "a.py"}, "/proj") == [
+        os.path.normpath("/proj/a.py")
+    ]
+    assert extract_paths("update_plan", {"tasks": []}, "/proj") == []
+
+
+# 功能：验证 approval_dir 对文件取父目录、对目录取自身
+# 设计：越界批准是目录级粒度，文件路径需升格到父目录
+def test_approval_dir() -> None:
+    assert approval_dir("/data/a.txt", is_dir=False) == os.path.normpath("/data")
+    assert approval_dir("/data/sub", is_dir=True) == os.path.normpath("/data/sub")
+
+
 # ── check_and_wait: ALLOW path ───────────────────────────────────────────────
 
-# 功能：验证策略为 ALLOW 时 check_and_wait 立即放行，不发任何事件
+# 功能：验证策略为 ALLOW 时 check_and_wait 立即返回 auto_allow，不发任何事件
 # 设计：read_file 默认 ALLOW，断言不产生 permission.requested 事件，覆盖"无噪声放行"路径
 async def test_check_and_wait_allow_no_event() -> None:
     mgr = _make_manager()
     emitted, emitter = await _collect_emitted()
 
-    allowed, decision = await mgr.check_and_wait(
+    res = await mgr.check_and_wait(
         tool_use_id="t1", tool_name="read_file",
         params={"path": "README.md"}, session_id="s1",
         event_emitter=emitter,
     )
 
-    assert allowed is True
-    assert decision == "auto_allow"
+    assert res.allowed is True
+    assert res.decision == "auto_allow"
     assert emitted == []
 
 
@@ -100,15 +131,15 @@ async def test_check_and_wait_ask_emits_event_and_waits() -> None:
         mgr.respond("t2", "allow_once")
 
     task = asyncio.create_task(_auto_respond())
-    allowed, decision = await mgr.check_and_wait(
+    res = await mgr.check_and_wait(
         tool_use_id="t2", tool_name="bash",
         params={"command": "echo hi"}, session_id="s1",
         event_emitter=emitter,
     )
     await task
 
-    assert allowed is True
-    assert decision == "allow_once"
+    assert res.allowed is True
+    assert res.decision == "allow_once"
     assert len(emitted) == 1
     assert emitted[0]["type"] == "permission.requested"
     assert emitted[0]["tool_use_id"] == "t2"
@@ -126,21 +157,21 @@ async def test_check_and_wait_reject_once_returns_false() -> None:
         mgr.respond("t3", "reject_once")
 
     task = asyncio.create_task(_auto_deny())
-    allowed, decision = await mgr.check_and_wait(
+    res = await mgr.check_and_wait(
         tool_use_id="t3", tool_name="bash",
         params={"command": "echo hi"}, session_id="s1",
         event_emitter=emitter,
     )
     await task
 
-    assert allowed is False
-    assert decision == "reject_once"
+    assert res.allowed is False
+    assert res.decision == "reject_once"
 
 
 # ── always_allow cache ───────────────────────────────────────────────────────
 
 # 功能：验证 respond("always_allow") 后同 session 同权限下次不再发事件
-# 设计：第二次调用 check_and_wait 命中 always 缓存，直接 auto_allow，emitted 仍为 1 条
+# 设计：第二次调用 check_and_wait 命中 always 缓存，直接返回 auto_allow，emitted 仍为 1 条
 async def test_always_allow_skips_future_ask() -> None:
     mgr = _make_manager()
     emitted, emitter = await _collect_emitted()
@@ -150,27 +181,27 @@ async def test_always_allow_skips_future_ask() -> None:
         mgr.respond("t4", "always_allow")
 
     task = asyncio.create_task(_auto_always())
-    allowed1, _ = await mgr.check_and_wait(
+    r1 = await mgr.check_and_wait(
         tool_use_id="t4", tool_name="bash",
         params={"command": "echo hi"}, session_id="s1",
         event_emitter=emitter,
     )
     await task
-    assert allowed1 is True
+    assert r1.allowed is True
 
-    allowed2, decision2 = await mgr.check_and_wait(
+    r2 = await mgr.check_and_wait(
         tool_use_id="t5", tool_name="bash",
         params={"command": "ls"}, session_id="s1",
         event_emitter=emitter,
     )
 
-    assert allowed2 is True
-    assert decision2 == "auto_allow"
+    assert r2.allowed is True
+    assert r2.decision == "auto_allow"
     assert len(emitted) == 1  # only the first call emitted an event
 
 
 # 功能：验证 always_allow 在同一 manager 实例内跨 session 生效（持久化规则共享）
-# 设计：s1 设置 always_allow → 写入持久化规则；s2 命中已保存规则，直接放行；emitted 只有 1 条
+# 设计：s1 设置 always_allow → 写入 _saved；s2 命中已保存规则，直接放行；emitted 只有 1 条
 async def test_always_allow_shared_across_sessions() -> None:
     mgr = _make_manager()
     emitted, emitter = await _collect_emitted()
@@ -187,14 +218,14 @@ async def test_always_allow_shared_across_sessions() -> None:
     )
     await task
 
-    allowed, decision = await mgr.check_and_wait(
+    r = await mgr.check_and_wait(
         tool_use_id="t7", tool_name="bash",
         params={"command": "echo"}, session_id="s2",
         event_emitter=emitter,
     )
 
-    assert allowed is True
-    assert decision == "auto_allow"
+    assert r.allowed is True
+    assert r.decision == "auto_allow"
     assert len(emitted) == 1  # s2 命中已保存规则，不再发出事件
 
 
@@ -212,14 +243,14 @@ async def test_cancel_session_resolves_pending_future() -> None:
         mgr.cancel_session("s1", reason="client_disconnected")
 
     task = asyncio.create_task(_cancel_after_emit())
-    allowed, _ = await mgr.check_and_wait(
+    res = await mgr.check_and_wait(
         tool_use_id="t10", tool_name="bash",
         params={"command": "ls"}, session_id="s1",
         event_emitter=emitter,
     )
     await task
 
-    assert allowed is False
+    assert res.allowed is False
 
 
 # 功能：验证 cancel_session 只取消属于该 session 的 pending Future
@@ -234,21 +265,21 @@ async def test_cancel_session_only_affects_target_session() -> None:
     s2_result: list[bool] = []
 
     async def _s1() -> None:
-        allowed, _ = await mgr.check_and_wait(
+        res = await mgr.check_and_wait(
             tool_use_id="ta", tool_name="bash",
             params={"command": "echo"}, session_id="s1",
             event_emitter=emitter,
         )
-        s1_result.append(allowed)
+        s1_result.append(res.allowed)
         s1_done.set()
 
     async def _s2() -> None:
-        allowed, _ = await mgr.check_and_wait(
+        res = await mgr.check_and_wait(
             tool_use_id="tb", tool_name="bash",
             params={"command": "echo"}, session_id="s2",
             event_emitter=emitter,
         )
-        s2_result.append(allowed)
+        s2_result.append(res.allowed)
         s2_done.set()
 
     t1 = asyncio.create_task(_s1())
@@ -278,6 +309,215 @@ def test_respond_unknown_tool_use_id_is_noop() -> None:
     mgr.respond("nonexistent", "allow_once")  # should not raise
 
 
+# ── OUTSIDE_CWD 不被 always 缓存绕过 ─────────────────────────────────────────
+
+# 功能：验证 bash 的工具级 always_allow 之后，操作工作目录外路径的命令仍触发越界审批
+# 设计：先对 bash 记「始终允许」（工具级），再用含绝对路径的命令请求；
+#       越界检查在工具级缓存之前，应发出 external_directory 事件，不被缓存绕过
+async def test_always_allow_bash_does_not_bypass_outside_dir() -> None:
+    mgr = _make_manager()
+    emitted, emitter = await _collect_emitted()
+
+    async def _auto_always() -> None:
+        await asyncio.sleep(0)
+        mgr.respond("t_always", "always_allow")
+
+    t = asyncio.create_task(_auto_always())
+    await mgr.check_and_wait(
+        tool_use_id="t_always", tool_name="bash",
+        params={"command": "echo ok"}, session_id="s1",
+        event_emitter=emitter,
+        working_dir="/proj",
+    )
+    await t
+    assert len(emitted) == 1  # 首次 ASK 触发事件
+
+    async def _auto_respond_abs() -> None:
+        await asyncio.sleep(0)
+        mgr.respond("t_abs", "allow_once")
+
+    t2 = asyncio.create_task(_auto_respond_abs())
+    res = await mgr.check_and_wait(
+        tool_use_id="t_abs", tool_name="bash",
+        params={"command": "cat /etc/hosts"}, session_id="s1",
+        event_emitter=emitter,
+        working_dir="/proj",
+    )
+    await t2
+
+    assert res.allowed is True
+    assert len(emitted) == 2  # 越界命令再次触发 ASK，共 2 个事件
+    assert emitted[1]["permission"] == EXTERNAL_DIRECTORY
+
+
+# 功能：验证 bash 命令中的越界路径被 tree-sitter 提取并先触发越界审批
+# 设计：working_dir=/proj，`cat /etc/hosts` 的绝对路径参数被提取 → 先问 external_directory；
+#       随后 bash 工具级也 ASK（默认策略），故对每个请求都自动 allow_once
+async def test_bash_outside_path_triggers_ask() -> None:
+    mgr = _make_manager()
+    emitted: list[dict[str, Any]] = []
+
+    async def emitter(event: dict[str, Any]) -> None:
+        emitted.append(event)
+        mgr.respond(event["tool_use_id"], "allow_once")
+
+    res = await mgr.check_and_wait(
+        tool_use_id="b1", tool_name="bash",
+        params={"command": "cat /etc/hosts"}, session_id="s1",
+        event_emitter=emitter,
+        working_dir="/proj",
+    )
+
+    assert res.allowed is True
+    assert emitted[0]["permission"] == EXTERNAL_DIRECTORY
+    assert emitted[0]["resource"] == os.path.normpath("/etc")
+
+
+# ── 越界横切权限（external_directory） ────────────────────────────────────────
+
+# 功能：验证读取工作目录之外的路径会触发 external_directory 审批
+# 设计：working_dir=/proj，read_file 请求 /data/a.txt 越界；断言事件 permission 为
+#       external_directory 且 resource 为目录 /data（目录级粒度）
+async def test_outside_working_dir_triggers_ask() -> None:
+    mgr = _make_manager()
+    emitted, emitter = await _collect_emitted()
+
+    async def _auto_allow() -> None:
+        await asyncio.sleep(0)
+        mgr.respond("o1", "allow_once")
+
+    task = asyncio.create_task(_auto_allow())
+    res = await mgr.check_and_wait(
+        tool_use_id="o1", tool_name="read_file",
+        params={"path": "/data/a.txt"}, session_id="s1",
+        event_emitter=emitter,
+        working_dir="/proj",
+    )
+    await task
+
+    assert res.allowed is True
+    assert len(emitted) == 1
+    assert emitted[0]["permission"] == EXTERNAL_DIRECTORY
+    assert emitted[0]["resource"] == os.path.normpath("/data")
+
+
+# 功能：验证工作目录内的路径不触发越界审批
+# 设计：read_file 请求 /proj/a.txt（在工作目录内），read_file 默认 ALLOW，不应发事件
+async def test_inside_working_dir_no_ask() -> None:
+    mgr = _make_manager()
+    emitted, emitter = await _collect_emitted()
+
+    res = await mgr.check_and_wait(
+        tool_use_id="o2", tool_name="read_file",
+        params={"path": "/proj/a.txt"}, session_id="s1",
+        event_emitter=emitter,
+        working_dir="/proj",
+    )
+
+    assert res.allowed is True
+    assert emitted == []
+
+
+# 功能：验证对某越界目录选择 always_allow 后，同目录不再询问
+# 设计：第一次批准 /data 后写入 _saved；第二次访问 /data/b.txt 命中目录包含，直接放行
+async def test_outside_always_allow_remembers_directory() -> None:
+    mgr = _make_manager()
+    emitted, emitter = await _collect_emitted()
+
+    async def _auto_always() -> None:
+        await asyncio.sleep(0)
+        mgr.respond("o3", "always_allow")
+
+    task = asyncio.create_task(_auto_always())
+    await mgr.check_and_wait(
+        tool_use_id="o3", tool_name="read_file",
+        params={"path": "/data/a.txt"}, session_id="s1",
+        event_emitter=emitter,
+        working_dir="/proj",
+    )
+    await task
+    assert len(emitted) == 1
+
+    res = await mgr.check_and_wait(
+        tool_use_id="o4", tool_name="read_file",
+        params={"path": "/data/b.txt"}, session_id="s1",
+        event_emitter=emitter,
+        working_dir="/proj",
+    )
+
+    assert res.allowed is True
+    assert res.decision == "auto_allow"
+    assert len(emitted) == 1  # 同目录已批准，不再询问
+
+
+# 功能：验证越界批准按项目隔离——A 项目的批准不影响 B 项目
+# 设计：在 /projA 下批准 /data；切到 /projB 访问 /data 时应重新询问（project 不同不命中）
+async def test_outside_approval_is_project_scoped() -> None:
+    mgr = _make_manager()
+    emitted, emitter = await _collect_emitted()
+
+    async def _auto_always() -> None:
+        await asyncio.sleep(0)
+        mgr.respond("o5", "always_allow")
+
+    task = asyncio.create_task(_auto_always())
+    await mgr.check_and_wait(
+        tool_use_id="o5", tool_name="read_file",
+        params={"path": "/data/a.txt"}, session_id="s1",
+        event_emitter=emitter,
+        working_dir="/projA",
+    )
+    await task
+    assert len(emitted) == 1
+
+    async def _auto_once() -> None:
+        await asyncio.sleep(0)
+        mgr.respond("o6", "allow_once")
+
+    task2 = asyncio.create_task(_auto_once())
+    res = await mgr.check_and_wait(
+        tool_use_id="o6", tool_name="read_file",
+        params={"path": "/data/a.txt"}, session_id="s2",
+        event_emitter=emitter,
+        working_dir="/projB",
+    )
+    await task2
+
+    assert res.allowed is True
+    assert len(emitted) == 2  # 不同项目 → 需重新批准
+
+
+# 功能：验证子 agent 继承父会话的越界批准（同一 manager + 同一 working_dir）
+# 设计：父会话批准 /data 后，子 agent 用同一 session/working_dir 访问 /data 直接放行
+async def test_subagent_inherits_outside_approval() -> None:
+    mgr = _make_manager()
+    emitted, emitter = await _collect_emitted()
+
+    async def _auto_always() -> None:
+        await asyncio.sleep(0)
+        mgr.respond("o7", "always_allow")
+
+    task = asyncio.create_task(_auto_always())
+    await mgr.check_and_wait(
+        tool_use_id="o7", tool_name="read_file",
+        params={"path": "/data/a.txt"}, session_id="s1",
+        event_emitter=emitter,
+        working_dir="/proj",
+    )
+    await task
+
+    # 子 agent 用同一 session_id（SpawnAgentTool 传入父 session_id）
+    res = await mgr.check_and_wait(
+        tool_use_id="o8", tool_name="read_file",
+        params={"path": "/data/c.txt"}, session_id="s1",
+        event_emitter=emitter,
+        working_dir="/proj",
+    )
+
+    assert res.allowed is True
+    assert res.decision == "auto_allow"
+
+
 # ── 审批超时 ──────────────────────────────────────────────────────────────────
 
 # 功能：验证 check_and_wait 超时后返回 allowed=False、decision="timeout"，不永久挂起
@@ -288,14 +528,14 @@ async def test_permission_timeout_returns_false() -> None:
     )
     emitted, emitter = await _collect_emitted()
 
-    allowed, decision = await mgr.check_and_wait(
+    res = await mgr.check_and_wait(
         tool_use_id="t_timeout", tool_name="bash",
         params={"command": "echo hi"}, session_id="s1",
         event_emitter=emitter,
     )
 
-    assert allowed is False
-    assert decision == "timeout"
+    assert res.allowed is False
+    assert res.decision == "timeout"
     assert len(emitted) == 1
     assert emitted[0]["type"] == "permission.requested"
 

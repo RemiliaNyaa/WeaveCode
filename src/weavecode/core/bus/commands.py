@@ -21,6 +21,7 @@ class PongResult(BaseModel):
 class AgentRunCommand(BaseModel):
     type: Literal["agent.run"] = "agent.run"
     goal: str
+    cwd: str = ""  # 客户端工作目录绝对路径；空串回退到 daemon cwd
 
 
 class AgentRunResult(BaseModel):
@@ -43,6 +44,7 @@ class SessionCreateCommand(BaseModel):
     type: Literal["session.create"] = "session.create"
     mode: SessionMode = "chat"
     title: str = ""
+    cwd: str = ""  # 客户端工作目录绝对路径；空串回退到 daemon cwd
 
 
 class SessionCreateResult(BaseModel):

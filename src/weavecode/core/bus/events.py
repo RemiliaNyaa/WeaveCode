@@ -158,6 +158,10 @@ class PermissionRequestedEvent(BaseModel):
     params: dict[str, Any]
     param_preview: str
     session_id: str
+    # 触发本次审批的权限名：越界为 "external_directory"，其余为工具名
+    permission: str = ""
+    # 资源：越界时为被访问的目录，工具级为 "*"
+    resource: str = ""
     ts: str
 
 

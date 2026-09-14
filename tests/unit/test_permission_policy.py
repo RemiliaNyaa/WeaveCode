@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from weavecode.core.permissions.policy import (
     DEFAULT_POLICIES,
     PermissionDecision,
@@ -8,66 +10,130 @@ from weavecode.core.permissions.policy import (
     evaluate_soft,
     param_preview,
 )
+from weavecode.core.permissions.shell_paths import extract_shell_paths
 
-# ── 硬规则：黑名单 → 越界，未命中返回 None ─────────────────────────────────────
-
-
-# 功能：验证黑名单在硬规则里最先命中，直接拒绝、不进软规则
-# 设计：deny_patterns 属于"不可被任何用户选择覆盖"的一层，命中即 DENY
-def test_hard_deny_pattern_wins() -> None:
-    policy = ToolPolicy(default=PermissionDecision.ALLOW, deny_patterns=[r"rm\s+-rf"])
-    assert evaluate_hard("bash", {"command": "rm -rf /tmp"}, policy) == PermissionDecision.DENY
-
-
-# 功能：验证访问工作目录之外的命令被硬规则强制询问
-# 设计：越界只对 bash 判定（路径藏在命令串里），干净命令硬规则不表态，交给软规则
-def test_hard_outside_cwd_forces_ask() -> None:
+# 功能：验证越界不由 evaluate_hard 处理（已移交 tree-sitter + external_directory）
+# 设计：绝对路径命令在 hard 层返回 None，越界判定统一由 extract_shell_paths 承担
+def test_hard_no_longer_handles_outside_cwd() -> None:
     policy = ToolPolicy(default=PermissionDecision.ALLOW)
-    assert evaluate_hard("bash", {"command": "cat /etc/passwd"}, policy) == PermissionDecision.ASK
-    assert evaluate_hard("bash", {"command": "ls -la"}, policy) is None
+    assert evaluate_hard("bash", {"command": "cat /etc/hosts"}, policy) is None
 
 
-# 功能：验证非 bash 工具与缺少 command 字段的调用不走命令硬规则
-# 设计：硬规则只看命令串，其余工具的路径越界由横切层负责，这里必须返回 None
-def test_hard_skips_non_bash_tools() -> None:
-    policy = ToolPolicy(default=PermissionDecision.ASK)
-    assert evaluate_hard("write_file", {"path": "/tmp/x", "content": "y"}, policy) is None
-    assert evaluate_hard("bash", {"args": "ls"}, policy) is None
+# 功能：验证非 bash 工具无硬规则
+# 设计：只有 bash 有命令内容；read_file 等即使路径越界也不在 hard 层判定
+
+# 功能：验证非 bash 工具无硬规则
+# 设计：只有 bash 有命令内容；read_file 等即使路径越界也不在 hard 层判定
+def test_hard_non_bash_no_rules() -> None:
+    policy = ToolPolicy(default=PermissionDecision.ALLOW)
+    assert evaluate_hard("read_file", {"path": "/etc/hosts"}, policy) is None
 
 
-# ── 软规则：白名单 → 默认值，可被用户缓存覆盖 ──────────────────────────────────
+# ── is_dangerous_command: 危险命令识别 ───────────────────────────────────────
+
+# 功能：验证强制删除 / 提权 / 磁盘操作被识别为危险
+# 设计：覆盖 rm 的多种 flag 写法与 sudo/su/dd/mkfs
+
+# 功能：验证能提取绝对路径参数并判定为工作目录之外
+# 设计：cat 是路径命令白名单成员，/etc/passwd 应被提取为绝对路径
+def test_shell_paths_absolute() -> None:
+    got = extract_shell_paths("cat /etc/passwd", "/proj")
+    assert got == [os.path.normpath("/etc/passwd")]
 
 
-# 功能：验证白名单命中直接放行，未命中回工具默认值
-# 设计：软规则不做任何"越界/危险"判断，只在名单与默认值之间二选一
-def test_soft_allow_pattern_wins() -> None:
-    policy = ToolPolicy(default=PermissionDecision.ASK, allow_patterns=[r"^ls "])
-    assert evaluate_soft("bash", {"command": "ls -la"}, policy) == PermissionDecision.ALLOW
-    assert evaluate_soft("bash", {"command": "cat x"}, policy) == PermissionDecision.ASK
+# 功能：验证相对路径按工作目录归一化后仍在目录内
+# 设计：相对路径不越界（normalize_path 以 working_dir 为基准拼接）
+
+# 功能：验证相对路径按工作目录归一化后仍在目录内
+# 设计：相对路径不越界（normalize_path 以 working_dir 为基准拼接）
+def test_shell_paths_relative_stays_inside() -> None:
+    got = extract_shell_paths("cat notes.txt", "/proj")
+    assert got == [os.path.normpath("/proj/notes.txt")]
 
 
-# 功能：验证判定结果按传入策略的默认值返回
-# 设计：软规则不读任何名单，只返回 default；不同工具可有不同默认
+# 功能：验证 ~ 被展开为家目录
+# 设计：~/.ssh 属于家目录，越出工作目录
+
+# 功能：验证 ~ 被展开为家目录
+# 设计：~/.ssh 属于家目录，越出工作目录
+def test_shell_paths_tilde_expands() -> None:
+    got = extract_shell_paths("cat ~/.ssh/id_rsa", "/proj")
+    assert got == [os.path.normpath(str(__import__("pathlib").Path.home() / ".ssh" / "id_rsa"))]
+
+
+# 功能：验证非白名单命令不提取路径（避免把普通参数误判为路径）
+# 设计：echo 不是路径命令，其参数不应被当作路径
+
+# 功能：验证非白名单命令不提取路径（避免把普通参数误判为路径）
+# 设计：echo 不是路径命令，其参数不应被当作路径
+def test_shell_paths_non_path_command_ignored() -> None:
+    assert extract_shell_paths("echo /etc/hosts", "/proj") == []
+
+
+# 功能：验证动态内容（$VAR、命令替换）被保守跳过
+# 设计：无法静态解析的值不应误判为目录内，也不应误报（交给 bash 工具级审批兜底）
+
+# 功能：验证动态内容（$VAR、命令替换）被保守跳过
+# 设计：无法静态解析的值不应误判为目录内，也不应误报（交给 bash 工具级审批兜底）
+def test_shell_paths_dynamic_skipped() -> None:
+    assert extract_shell_paths("cat $SECRET", "/proj") == []
+    assert extract_shell_paths("cat $(pwd)/x", "/proj") == []
+
+
+# 功能：验证通配符参数被截断到前缀
+# 设计：ls /data/*.txt → 提取 /data/，从而判定越界
+
+# 功能：验证通配符参数被截断到前缀
+# 设计：ls /data/*.txt → 提取 /data/，从而判定越界
+def test_shell_paths_glob_prefix() -> None:
+    got = extract_shell_paths("ls /data/*.txt", "/proj")
+    assert got == [os.path.normpath("/data")]
+
+
+# 功能：验证管道与 && 链式命令中的路径都能被提取
+# 设计：语法树遍历覆盖 pipeline / list 等复合结构，不漏检
+
+# 功能：验证管道与 && 链式命令中的路径都能被提取
+# 设计：语法树遍历覆盖 pipeline / list 等复合结构，不漏检
+def test_shell_paths_pipeline_and_chain() -> None:
+    got = extract_shell_paths("cat /etc/hosts | grep localhost && cat /var/log/x", "/proj")
+    assert os.path.normpath("/etc/hosts") in got
+    assert os.path.normpath("/var/log/x") in got
+
+
+# 功能：验证引号包裹的路径被正确去引号
+# 设计：cat "/data/a b.txt" → 提取含空格的绝对路径
+
+# 功能：验证引号包裹的路径被正确去引号
+# 设计：cat "/data/a b.txt" → 提取含空格的绝对路径
+def test_shell_paths_quoted() -> None:
+    got = extract_shell_paths('cat "/data/a b.txt"', "/proj")
+    assert got == [os.path.normpath("/data/a b.txt")]
+
+
+# ── evaluate_soft: 默认策略（DEFAULT_POLICIES）────────────────────────────────
+
+# 功能：验证 evaluate_soft 直接返回该工具的默认策略
+# 设计：工具层默认全放行（对齐 opencode），软规则不再读任何名单
+
+# 功能：验证 evaluate_soft 直接返回该工具的默认策略
+# 设计：工具层默认全放行（对齐 opencode），软规则不再读任何名单
 def test_soft_returns_tool_default() -> None:
-    assert (
-        evaluate_soft("bash", {"command": "ls -la"}, ToolPolicy(default=PermissionDecision.ALLOW))
-        == PermissionDecision.ALLOW
-    )
-    assert (
-        evaluate_soft("read_file", {"path": "x"}, ToolPolicy(default=PermissionDecision.ASK))
-        == PermissionDecision.ASK
-    )
+    assert evaluate_soft("bash", {"command": "echo hi"}, ToolPolicy(default=PermissionDecision.ASK)) == PermissionDecision.ASK
 
 
-# 功能：验证只读工具的默认策略是 ALLOW
+# 功能：验证 bash / write_file 默认策略是 ALLOW（工具层默认放行，对齐 opencode）
+# 设计：默认全放行，安全交给危险黑名单与越界层
+
+# 功能：验证 read_file / list_dir 等只读工具默认策略是 ALLOW
 # 设计：只读或安全工具默认不打扰用户，降低权限疲劳
 def test_soft_safe_tools_default_allow() -> None:
-    assert DEFAULT_POLICIES["read_file"].default == PermissionDecision.ALLOW
-    assert DEFAULT_POLICIES["list_dir"].default == PermissionDecision.ALLOW
+    assert evaluate_soft("read_file", {"path": "README.md"}, DEFAULT_POLICIES["read_file"]) == PermissionDecision.ALLOW
+    assert evaluate_soft("list_dir", {"path": "."}, DEFAULT_POLICIES["list_dir"]) == PermissionDecision.ALLOW
 
 
-# ── param_preview ──────────────────────────────────────────────────────────────
-
+# 功能：验证 write_file 默认策略是 ALLOW（工具层不再逐次审批）
+# 设计：写文件的位置风险由 external_directory 越界层负责
 
 # 功能：验证 param_preview 对已知工具返回 key='value' 格式的摘要
 # 设计：TUI 审批卡片依赖这个摘要让用户快速理解工具要做什么，格式必须稳定
@@ -75,6 +141,9 @@ def test_param_preview_known_tools() -> None:
     assert param_preview("bash", {"command": "echo hi"}) == "command='echo hi'"
     assert param_preview("read_file", {"path": "README.md"}) == "path='README.md'"
 
+
+# 功能：验证 param_preview 超出 60 字符时截断并加省略号
+# 设计：避免审批卡片展示超长命令撑破 UI 布局
 
 # 功能：验证 param_preview 超出 60 字符时截断并加省略号
 # 设计：避免审批卡片展示超长命令撑破 UI 布局

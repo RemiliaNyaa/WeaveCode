@@ -23,6 +23,7 @@ from weavecode.core.tools.registry import ToolRegistry
 
 if TYPE_CHECKING:
     from weavecode.core.permissions.manager import PermissionManager
+    from weavecode.core.permissions.policy import PermissionResult
 
 _DEFAULT_TIMEOUT: float = 120.0
 _MAX_RETRIES: int = 2
@@ -60,10 +61,22 @@ async def _fail(
     return ToolResult(content=error_message, is_error=True, error_type=error_class)
 
 
-# 构造拒绝回馈给模型的文案：讲清这是用户的决定，不是系统故障
-def _denial_message(decision: str) -> str:
+# 构造拒绝回馈给模型的文案：越界拒绝与工具级拒绝分别提示
+def _denial_message(result: PermissionResult) -> str:
+    if result.permission == "external_directory":
+        return (
+            f"The user rejected this attempt to access a path outside the working directory "
+            f"(requested directory: {result.resource}).\n"
+            "This is a deliberate decision by the user, NOT a tool or system failure. "
+            "The user has their reasons:\n"
+            "- Do NOT try to bypass it (switching tools, altering the path, or indirect "
+            "execution will not help).\n"
+            "- If the task genuinely requires this directory, explain why and ask the user "
+            "for permission.\n"
+            "- Otherwise, continue with an approach that stays inside the working directory."
+        )
     return (
-        f"The user rejected this tool call (decision: {decision}).\n"
+        f"The user rejected this `{result.permission}` tool call.\n"
         "This is a deliberate decision by the user, NOT a tool or system failure:\n"
         "- Do NOT retry the same call or try to bypass it.\n"
         "- If it is essential, explain why and ask the user for permission.\n"
@@ -81,6 +94,7 @@ async def invoke_tool(
     *,
     permission_manager: PermissionManager | None = None,
     session_id: str = "",
+    working_dir: str = "",
 ) -> ToolResult:
     t0 = time.monotonic()
 
@@ -117,30 +131,31 @@ async def invoke_tool(
         async def _emit_permission(raw: dict[str, Any]) -> None:
             await bus.publish(PermissionRequestedEvent(**raw, run_id=run_id))
 
-        allowed, decision = await permission_manager.check_and_wait(
+        perm = await permission_manager.check_and_wait(
             tool_use_id=tool_call.id,
             tool_name=tool_call.name,
             params=dict(tool_call.input),
             session_id=session_id,
             event_emitter=_emit_permission,
+            working_dir=working_dir,
         )
-        if allowed:
-            if decision != "auto_allow":
+        if perm.allowed:
+            if perm.decision not in ("auto_allow",):
                 await bus.publish(
                     PermissionGrantedEvent(
                         run_id=run_id,
                         tool_use_id=tool_call.id,
-                        decision=decision,
+                        decision=perm.decision,
                         ts=_now(),
                     )
                 )
         else:
-            if decision != "auto_deny":
+            if perm.decision != "auto_deny":
                 await bus.publish(
                     PermissionDeniedEvent(
                         run_id=run_id,
                         tool_use_id=tool_call.id,
-                        decision=decision,
+                        decision=perm.decision,
                         ts=_now(),
                     )
                 )
@@ -148,7 +163,7 @@ async def invoke_tool(
             return await _fail(
                 bus, run_id, tool_call,
                 "permission_denied",
-                _denial_message(decision),
+                _denial_message(perm),
                 elapsed(),
             )
 
