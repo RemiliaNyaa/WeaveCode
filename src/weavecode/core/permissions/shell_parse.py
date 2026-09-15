@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator
 
 import tree_sitter_bash
@@ -29,6 +30,14 @@ def iter_command_nodes(node: Node) -> Iterator[Node]:
         yield from iter_command_nodes(child)
 
 
+# 递归遍历语法树，产出指定类型的节点
+def iter_nodes_of_type(node: Node, types: frozenset[str]) -> Iterator[Node]:
+    if node.type in types:
+        yield node
+    for child in node.children:
+        yield from iter_nodes_of_type(child, types)
+
+
 # 读取节点原文
 def node_text(node: Node) -> str:
     return node.text.decode("utf-8", errors="replace") if node.text else ""
@@ -37,6 +46,14 @@ def node_text(node: Node) -> str:
 # 返回一个 command 节点的各部分原文（[命令名, 参数...]）
 def command_tokens(cmd_node: Node) -> list[str]:
     return [node_text(child) for child in cmd_node.children]
+
+
+# 取命令名：去路径前缀 + 转小写（/bin/RM → rm）
+def command_name(cmd_node: Node) -> str:
+    parts = cmd_node.children
+    if not parts:
+        return ""
+    return os.path.basename(node_text(parts[0])).lower()
 
 
 # 去掉包裹字符串的引号（单引号/双引号）
