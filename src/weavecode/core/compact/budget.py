@@ -2,22 +2,29 @@ from __future__ import annotations
 
 from typing import Any
 
+from weavecode.core.compact.tokens import estimate_messages
+
 TOOL_RESULT_LIMIT = 8_000
 TOOL_RESULT_KEEP = 4_000
 
-# 本次请求要给输出预留的 token（对应硬编码的 max_tokens）
-_RESERVE_TOKENS = 8_192
+
+# 确定性降级：从最老的消息开始丢弃，直到估算不超过预算；不调 LLM、不会失败
+def shrink_to_fit(messages: list[dict[str, Any]], budget_tokens: int) -> list[dict[str, Any]]:
+    kept = list(messages)
+    while len(kept) > 1 and estimate_messages(kept) > budget_tokens:
+        kept = kept[1:]
+    # 丢弃头部可能让首条变成「没有对应 tool_use 的 tool_result」，继续丢掉直到合法
+    while len(kept) > 1 and _leads_with_tool_result(kept[0]):
+        kept = kept[1:]
+    return kept
 
 
-# 按上一轮请求的上下文水位换算本轮输入可用的预算：
-# 窗口里已被占用的部分扣掉，再为本次输出留出余量；水位打满时预算为 0
-def budget_from_watermark(
-    context_pct: float,
-    window_tokens: int,
-    reserve_tokens: int = _RESERVE_TOKENS,
-) -> int:
-    used = int(context_pct * window_tokens)
-    return max(0, window_tokens - used - reserve_tokens)
+# 判断一条消息是否为只含 tool_result 的 user 消息
+def _leads_with_tool_result(message: dict[str, Any]) -> bool:
+    content = message.get("content")
+    if message.get("role") != "user" or not isinstance(content, list):
+        return False
+    return any(isinstance(block, dict) and block.get("type") == "tool_result" for block in content)
 
 
 # 对消息列表中超长的 tool_result 内容做内存截断，返回处理后的新列表

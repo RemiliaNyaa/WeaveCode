@@ -1,0 +1,331 @@
+{
+  "version": "2026-09-20",
+  "source": "https://models.opencode.ai/api.json",
+  "providers": {
+    "anthropic": {
+      "name": "Anthropic",
+      "models": {
+        "claude-opus-4-8": {
+          "name": "Claude Opus 4.8",
+          "context": 1000000,
+          "output": 128000,
+          "reasoning": true
+        },
+        "claude-opus-5": {
+          "name": "Claude Opus 5",
+          "context": 1000000,
+          "output": 128000,
+          "reasoning": true
+        },
+        "claude-sonnet-5": {
+          "name": "Claude Sonnet 5",
+          "context": 1000000,
+          "output": 128000,
+          "reasoning": true
+        },
+        "claude-sonnet-4-6": {
+          "name": "Claude Sonnet 4.6",
+          "context": 1000000,
+          "output": 128000,
+          "reasoning": true
+        },
+        "claude-haiku-4-5": {
+          "name": "Claude Haiku 4.5 (latest)",
+          "context": 200000,
+          "output": 64000,
+          "reasoning": true
+        }
+      }
+    },
+    "deepseek": {
+      "name": "DeepSeek",
+      "models": {
+        "deepseek-v4-pro": {
+          "name": "DeepSeek V4 Pro",
+          "context": 1000000,
+          "output": 384000,
+          "reasoning": true
+        },
+        "deepseek-v4-flash": {
+          "name": "DeepSeek V4 Flash",
+          "context": 1000000,
+          "output": 384000,
+          "reasoning": true
+        }
+      }
+    },
+    "moonshotai": {
+      "name": "Moonshot AI",
+      "models": {
+        "kimi-k3": {
+          "name": "Kimi K3",
+          "context": 1048576,
+          "output": 131072,
+          "reasoning": true
+        },
+        "kimi-k2.6": {
+          "name": "Kimi K2.6",
+          "context": 262144,
+          "output": 262144,
+          "reasoning": true
+        }
+      }
+    },
+    "moonshotai-cn": {
+      "name": "Moonshot AI (China)",
+      "models": {
+        "kimi-k3": {
+          "name": "Kimi K3",
+          "context": 1048576,
+          "output": 131072,
+          "reasoning": true
+        },
+        "kimi-k2.6": {
+          "name": "Kimi K2.6",
+          "context": 262144,
+          "output": 262144,
+          "reasoning": true
+        }
+      }
+    },
+    "zhipuai": {
+      "name": "Zhipu AI",
+      "models": {
+        "glm-5.3": {
+          "name": "GLM-5.3",
+          "context": 1000000,
+          "output": 131072,
+          "reasoning": true
+        },
+        "glm-5.2": {
+          "name": "GLM-5.2",
+          "context": 1000000,
+          "output": 131072,
+          "reasoning": true
+        },
+        "glm-4.7-flash": {
+          "name": "GLM-4.7-Flash",
+          "context": 200000,
+          "output": 131072,
+          "reasoning": true
+        }
+      }
+    },
+    "zai": {
+      "name": "Z.AI",
+      "models": {
+        "glm-5.3": {
+          "name": "GLM-5.3",
+          "context": 1000000,
+          "output": 131072,
+          "reasoning": true
+        },
+        "glm-5.2": {
+          "name": "GLM-5.2",
+          "context": 1000000,
+          "output": 131072,
+          "reasoning": true
+        },
+        "glm-4.7-flash": {
+          "name": "GLM-4.7-Flash",
+          "context": 200000,
+          "output": 131072,
+          "reasoning": true
+        }
+      }
+    },
+    "minimax": {
+      "name": "MiniMax (minimax.io)",
+      "models": {
+        "MiniMax-M3": {
+          "name": "MiniMax-M3",
+          "context": 1048576,
+          "output": 512000,
+          "reasoning": true
+        },
+        "MiniMax-M2.7": {
+          "name": "MiniMax-M2.7",
+          "context": 204800,
+          "output": 131072,
+          "reasoning": true
+        }
+      }
+    },
+    "minimax-cn": {
+      "name": "MiniMax (minimax.cn)",
+      "models": {
+        "MiniMax-M3": {
+          "name": "MiniMax-M3",
+          "context": 1048576,
+          "output": 512000,
+          "reasoning": true
+        },
+        "MiniMax-M2.7": {
+          "name": "MiniMax-M2.7",
+          "context": 204800,
+          "output": 131072,
+          "reasoning": true
+        }
+      }
+    },
+    "alibaba": {
+      "name": "Alibaba",
+      "models": {
+        "qwen3.8-max": {
+          "name": "Qwen3.8 Max",
+          "context": 1000000,
+          "output": 131072,
+          "reasoning": true
+        },
+        "qwen3.7-max": {
+          "name": "Qwen3.7 Max",
+          "context": 1000000,
+          "output": 65536,
+          "reasoning": true
+        },
+        "qwen3.6-flash": {
+          "name": "Qwen3.6 Flash",
+          "context": 1000000,
+          "output": 65536,
+          "reasoning": true
+        }
+      }
+    },
+    "alibaba-cn": {
+      "name": "Alibaba (China)",
+      "models": {
+        "qwen3.8-max": {
+          "name": "Qwen3.8 Max",
+          "context": 1000000,
+          "output": 131072,
+          "reasoning": true
+        },
+        "qwen3.7-max": {
+          "name": "Qwen3.7 Max",
+          "context": 1000000,
+          "output": 65536,
+          "reasoning": true
+        },
+        "qwen3.6-flash": {
+          "name": "Qwen3.6 Flash",
+          "context": 1000000,
+          "output": 65536,
+          "reasoning": true
+        }
+      }
+    },
+    "volcengine": {
+      "name": "Volcengine Ark",
+      "models": {
+        "doubao-seed-2-1-pro-260628": {
+          "name": "Seed 2.1 Pro",
+          "context": 256000,
+          "output": 256000,
+          "reasoning": true
+        },
+        "doubao-seed-2-0-lite-260428": {
+          "name": "Seed 2.0 Lite",
+          "context": 256000,
+          "output": 131072,
+          "reasoning": true
+        }
+      }
+    },
+    "tencent-tokenhub": {
+      "name": "Tencent TokenHub",
+      "models": {
+        "hy4-preview": {
+          "name": "Hy4 preview",
+          "context": 1024000,
+          "output": 64000,
+          "reasoning": true
+        },
+        "hy3": {
+          "name": "Hy3",
+          "context": 256000,
+          "output": 128000,
+          "reasoning": true
+        }
+      }
+    },
+    "siliconflow": {
+      "name": "SiliconFlow",
+      "models": {
+        "deepseek-ai/DeepSeek-V4-Pro": {
+          "name": "DeepSeek V4 Pro",
+          "context": 1000000,
+          "output": 384000,
+          "reasoning": true
+        },
+        "deepseek-ai/DeepSeek-V4-Flash": {
+          "name": "DeepSeek V4 Flash",
+          "context": 1000000,
+          "output": 384000,
+          "reasoning": true
+        }
+      }
+    },
+    "siliconflow-cn": {
+      "name": "SiliconFlow (China)",
+      "models": {
+        "deepseek-ai/DeepSeek-V4-Pro": {
+          "name": "deepseek-ai/DeepSeek-V4-Pro",
+          "context": 1049000,
+          "output": 393000,
+          "reasoning": true
+        },
+        "deepseek-ai/DeepSeek-V4-Flash": {
+          "name": "DeepSeek V4 Flash",
+          "context": 1000000,
+          "output": 384000,
+          "reasoning": true
+        }
+      }
+    },
+    "bailing": {
+      "name": "Bailing",
+      "models": {
+        "Ling-1T": {
+          "name": "Ling-1T",
+          "context": 128000,
+          "output": 32000,
+          "reasoning": false
+        }
+      }
+    },
+    "stepfun": {
+      "name": "StepFun (China)",
+      "models": {
+        "step-3.7-flash": {
+          "name": "Step 3.7 Flash",
+          "context": 256000,
+          "output": 256000,
+          "reasoning": true
+        },
+        "step-3.5-flash": {
+          "name": "Step 3.5 Flash",
+          "context": 256000,
+          "output": 256000,
+          "reasoning": true
+        }
+      }
+    },
+    "stepfun-ai": {
+      "name": "StepFun (Global)",
+      "models": {
+        "step-3.7-flash": {
+          "name": "Step 3.7 Flash",
+          "context": 256000,
+          "output": 256000,
+          "reasoning": true
+        },
+        "step-3.5-flash": {
+          "name": "Step 3.5 Flash",
+          "context": 256000,
+          "output": 256000,
+          "reasoning": true
+        }
+      }
+    }
+  }
+}

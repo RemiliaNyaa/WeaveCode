@@ -11,12 +11,8 @@ from weavecode.core.events.bus import EventBus
 from weavecode.core.llm import model_table
 from weavecode.core.llm.types import LlmResponse, ToolCallBlock, UsageStats
 
-# 单次请求的输出上限
+# 单次请求的输出上限默认值；实际取它与模型输出上限的较小者
 _DEFAULT_MAX_TOKENS = 8_192
-
-# tool_result 超过这个字符数就截断，只保留 keep 部分
-TOOL_RESULT_LIMIT = 8_000
-TOOL_RESULT_KEEP = 4_000
 
 _SYSTEM_PROMPT = (
     "You are Weave, an AI assistant operating in a terminal environment. "
@@ -29,6 +25,9 @@ _SYSTEM_PROMPT = (
     "reading and listing, write_file/edit_file for writing and editing, and "
     "bash only for actual system commands (git, tests, package managers). "
     "Do not use bash to read or edit files when the dedicated tools exist.\n"
+    "- Search for files with glob (by name pattern) and grep (by content regex); "
+    "prefer them over running rg/grep through bash. Pass an absolute path "
+    "directory to narrow the search.\n"
     "- When multiple tool calls are independent, call them in parallel in a single "
     "step to save time. Only call tools sequentially when one result is needed "
     "to construct the next call.\n"
@@ -66,41 +65,6 @@ _SYSTEM_PROMPT = (
 # 返回当前 UTC 时间的 ISO 8601 字符串
 def _now() -> str:
     return datetime.now(UTC).isoformat()
-
-
-# 对消息列表里超长的 tool_result 做内存截断，返回新列表，历史原样不动
-def truncate_tool_results(
-    messages: list[dict[str, object]],
-    limit: int = TOOL_RESULT_LIMIT,
-    keep: int = TOOL_RESULT_KEEP,
-) -> list[dict[str, object]]:
-    result: list[dict[str, object]] = []
-    for message in messages:
-        if message.get("role") != "user":
-            result.append(message)
-            continue
-        content = message.get("content")
-        if not isinstance(content, list):
-            result.append(message)
-            continue
-        new_blocks: list[object] = []
-        for block in content:
-            if (
-                isinstance(block, dict)
-                and block.get("type") == "tool_result"
-                and isinstance(block.get("content"), str)
-            ):
-                text = str(block["content"])
-                if len(text) > limit:
-                    omitted = len(text) - keep
-                    block = dict(block)
-                    block["content"] = (
-                        text[:keep]
-                        + f"\n[... {omitted} chars omitted. Full output in run events.]"
-                    )
-            new_blocks.append(block)
-        result.append({**message, "content": new_blocks})
-    return result
 
 
 class AnthropicProvider:
@@ -148,7 +112,7 @@ class AnthropicProvider:
 
         kwargs: dict[str, object] = {
             "model": self._model,
-            "max_tokens": _DEFAULT_MAX_TOKENS,
+            "max_tokens": min(_DEFAULT_MAX_TOKENS, model_table.max_output(self._model)),
             "system": system_blocks,
             "messages": messages,
         }

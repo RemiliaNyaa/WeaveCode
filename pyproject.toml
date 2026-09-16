@@ -30,6 +30,8 @@ weave-tui = "weavecode.tui.__main__:main"
 # ---- Hatch：打 wheel 时从 src 布局收录包 ----
 [tool.hatch.build.targets.wheel]
 packages = ["src/weavecode"] # 源码在 src/weavecode
+# 模型表是运行时数据（非 .py），显式收录以确保进入 wheel
+artifacts = ["src/weavecode/data/*.json"]
 
 # ---- 开发期依赖（PEP 735）----
 [dependency-groups]

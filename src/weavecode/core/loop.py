@@ -6,11 +6,13 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from weavecode.core.bus.events import StepFinishedEvent, StepStartedEvent
+from weavecode.core.compact.budget import shrink_to_fit
+from weavecode.core.compact.tokens import RequestProjector, estimate_request
 from weavecode.core.context import ExecutionContext
 from weavecode.core.events.bus import EventBus
+from weavecode.core.llm import model_table
 from weavecode.core.llm.base import LLMProvider
-from weavecode.core.llm.provider import _SYSTEM_PROMPT, truncate_tool_results
-from weavecode.core.llm.types import UsageStats
+from weavecode.core.llm.provider import _SYSTEM_PROMPT
 from weavecode.core.tools.invocation import invoke_tool
 from weavecode.core.tools.registry import ToolRegistry
 
@@ -26,9 +28,6 @@ log = logging.getLogger(__name__)
 #   步数达到 max_steps            → failed: exceeded_max_steps
 #   LLM 调用抛错 / 被 Ctrl+C 取消 → failed: llm_error / cancelled
 # 工具执行出错不终止：错误作为结果回填，让模型自己换方案
-
-# 上下文水位达到这个比例就触发自动压缩
-_AUTO_COMPACT_THRESHOLD = 0.8
 
 
 def _now() -> str:
@@ -46,6 +45,9 @@ class AgentLoop:
         session_id: str = "",
         permission_manager: Any = None,
         compactor: Compactor | None = None,
+        auto_compact: bool = True,
+        reserve_tokens: int = 20_000,
+        model: str = "",
     ) -> None:
         self._provider = provider
         self._registry = registry
@@ -53,10 +55,14 @@ class AgentLoop:
         # 会话标识与权限管理器由 runner 注入，工具调用前先过审批
         self._session_id = session_id
         self._permission_manager = permission_manager
-        # 压缩器注入后水位到线才可能触发压缩；没有压缩器时循环照常跑
+        # 压缩在发请求前预判：装不下才压，压缩器缺席时循环照常跑
         self._compactor = compactor
-        # 上一轮请求的用量，水位判据用它来决定要不要压缩
-        self._last_usage: UsageStats | None = None
+        self._auto_compact = auto_compact
+        # 本次输出 + 估算容差的预留量，预算 = 模型窗口 - 预留
+        self._reserve_tokens = reserve_tokens
+        self._model = model
+        self._projector = RequestProjector()
+
 
     # 驱动 think → tool → observe 闭环，直到模型收工或步数用尽
     async def run(self, context: ExecutionContext) -> None:
@@ -67,17 +73,22 @@ class AgentLoop:
                 StepStartedEvent(run_id=context.run_id, step=context.step, ts=_now())
             )
 
+            system = context.system_prompt(_SYSTEM_PROMPT)
+            tools = self._registry.tool_schemas()
+
+            # 发请求前预判本次输入装不装得下；装不下先压缩，保证请求不被截断
+            await self._ensure_fits(context, system, tools)
+
             # think：把当前历史交给 LLM，让它决定下一步做什么
-            # 超长 tool_result 只在这份内存副本里截断，历史原样保留
-            outgoing = truncate_tool_results(list(context.messages))
+            sent_count = len(context.messages)
             try:
                 response = await self._provider.chat(
-                    messages=outgoing,
-                    tool_schemas=self._registry.tool_schemas(),
+                    messages=context.messages,
+                    tool_schemas=tools,
                     bus=self._bus,
                     run_id=context.run_id,
                     step=context.step,
-                    system=context.system_prompt(_SYSTEM_PROMPT),
+                    system=system,
                 )
             except asyncio.CancelledError:
                 # 必须向上传播，让上层有机会在文件关闭后收尾
@@ -88,15 +99,9 @@ class AgentLoop:
                 context.mark_failed("llm_error")
                 break
 
-            # 记录本轮用量：上下文水位随用量事件下发给客户端，这里留下原始数字供压缩判据使用
+            # 用真实 usage 校准下一次预判：纯字符估算对中文只有数量级精度
             if response.usage is not None:
-                self._last_usage = response.usage
-                log.debug(
-                    "context usage run_id=%s step=%d input_tokens=%d",
-                    context.run_id,
-                    context.step,
-                    response.usage.input_tokens,
-                )
+                self._projector.observe(response.usage.input_tokens, sent_count)
 
             # observe：响应先进历史，再执行工具——顺序反过来会破坏消息配对
             blocks: list[dict[str, object]] = list(response.thinking_blocks)
@@ -145,17 +150,45 @@ class AgentLoop:
             elif context.step >= context.max_steps and not context.is_done():
                 context.mark_failed("exceeded_max_steps")
 
-            # 水位到线就自动压缩（收到响应之后判一次）；手动 /compact 走同一个 Compactor 入口
-            if (
-                self._compactor is not None
-                and not context.is_done()
-                and self._last_usage is not None
-                and self._last_usage.context_pct >= _AUTO_COMPACT_THRESHOLD
-            ):
-                await self._compactor.compact(context, self._provider)
-                self._last_usage = None
-                log.info("context compacted run_id=%s step=%d", context.run_id, context.step)
-
             await self._bus.publish(
                 StepFinishedEvent(run_id=context.run_id, step=context.step, ts=_now())
+            )
+
+    # 发请求前预判：输入 + 输出预留装不下就先压缩；压缩不成再确定性降级，绝不硬发
+    async def _ensure_fits(
+        self,
+        context: ExecutionContext,
+        system: str,
+        tools: list[dict[str, Any]],
+    ) -> None:
+        if self._compactor is None or not self._auto_compact:
+            return
+        window = model_table.context_window(self._model)
+        budget = window - self._reserve_tokens
+        if budget <= 0:
+            return
+        projected = self._projector.project(system, context.messages, tools)
+        if projected <= budget:
+            return
+
+        log.info(
+            "pre-request compaction run_id=%s step=%d projected≈%d budget=%d window=%d",
+            context.run_id, context.step, projected, budget, window,
+        )
+        result = await self._compactor.compact(context, self._provider)
+        self._projector.reset()
+
+        if result is None:
+            context.messages = shrink_to_fit(context.messages, budget)
+            log.warning(
+                "compaction failed, deterministically shrank history run_id=%s step=%d",
+                context.run_id, context.step,
+            )
+            return
+
+        if estimate_request(system, context.messages, tools) > budget:
+            context.messages = shrink_to_fit(context.messages, budget)
+            log.warning(
+                "compaction insufficient, deterministically shrank history run_id=%s step=%d",
+                context.run_id, context.step,
             )

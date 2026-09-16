@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from weavecode.core.compact.budget import truncate_tool_results
+from weavecode.core.compact.budget import shrink_to_fit, truncate_tool_results
 
 
 def _make_tool_result_msg(content: str) -> dict:
@@ -29,6 +29,15 @@ def test_long_tool_result_truncated() -> None:
     assert len(truncated) < len(text)
     assert "chars omitted" in truncated
     assert truncated.startswith("y" * 4000)
+
+
+# 功能：验证 tool_result 内容恰好等于阈值时不截断
+# 设计：构造恰好 8000 字符内容，断言原文保持不变
+def test_exact_limit_untouched() -> None:
+    text = "z" * 8000
+    msgs = [_make_tool_result_msg(text)]
+    result = truncate_tool_results(msgs, limit=8000, keep=4000)
+    assert result[0]["content"][0]["content"] == text
 
 
 # 功能：验证 text 类型 block 不受截断影响
@@ -65,3 +74,52 @@ def test_assistant_message_untouched() -> None:
     msgs = [{"role": "assistant", "content": text}]
     result = truncate_tool_results(msgs, limit=8000, keep=4000)
     assert result[0]["content"] == text
+
+
+# 功能：验证确定性降级从最老的消息开始丢弃，直到估算不超过预算
+# 设计：10 条各约 104 token 的消息、预算 300，断言只剩 2 条
+def test_shrink_drops_oldest_until_fits() -> None:
+    messages = [{"role": "user", "content": "x" * 400} for _ in range(10)]
+
+    kept = shrink_to_fit(messages, budget_tokens=300)
+
+    assert len(kept) == 2
+    assert kept == messages[-2:]
+
+
+# 功能：验证预算充足时不丢弃任何消息
+# 设计：单条短消息 + 大预算，断言返回内容与输入一致
+def test_shrink_noop_when_within_budget() -> None:
+    messages = [{"role": "user", "content": "hi"}]
+
+    assert shrink_to_fit(messages, budget_tokens=10_000) == messages
+
+
+# 功能：验证丢弃头部后若首条成了孤立 tool_result，会继续丢弃直到合法
+# 设计：构造 assistant / tool_result / assistant，预算刚好要求丢掉第一条，
+#       断言结果首条不再是只含 tool_result 的 user 消息
+def test_shrink_skips_orphan_tool_result() -> None:
+    messages = [
+        {"role": "assistant", "content": "x" * 4_000},
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "y"}],
+        },
+        {"role": "assistant", "content": "z"},
+    ]
+
+    kept = shrink_to_fit(messages, budget_tokens=200)
+
+    assert kept
+    first = kept[0]
+    assert not (first["role"] == "user" and isinstance(first["content"], list))
+
+
+# 功能：验证只剩一条消息时不做无限丢弃（保底不返回空列表）
+# 设计：单条超大消息 + 极小预算，断言结果仍保留这条消息
+def test_shrink_keeps_last_message() -> None:
+    messages = [{"role": "user", "content": "x" * 100_000}]
+
+    kept = shrink_to_fit(messages, budget_tokens=10)
+
+    assert len(kept) == 1
