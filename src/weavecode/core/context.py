@@ -15,9 +15,7 @@ class ExecutionContext:
     max_steps: int
     # 调用方注入的既有消息（会话回放）；为空时从 goal 起头
     prefill_messages: list[dict[str, Any]] = field(default_factory=list)
-    # 本会话累积下来的笔记
-    session_notes: str = ""
-    # 全局与项目两级背景文件的内容，空段自动跳过
+    # 全局与项目两级 AGENTS.md 规则文件的内容，空段自动跳过
     global_context: str = ""
     project_context: str = ""
     messages: list[dict[str, Any]] = field(default_factory=list)
@@ -39,7 +37,7 @@ class ExecutionContext:
         elif not self.messages:
             self.messages.append({"role": "user", "content": self.goal})
 
-    # 返回本次运行的 system prompt：基础段 + 环境信息 + 三层上下文 + 技能清单
+    # 返回本次运行的 system prompt：基础段 + 环境信息 + 规则层 + 技能清单
     # 基础段由循环传入（角色与使用策略的单一事实来源），本函数只负责分层拼接
     def system_prompt(self, base: str) -> str:
         parts = [base]
@@ -50,12 +48,17 @@ class ExecutionContext:
             f"  Platform: {platform.system()}\n"
             "</env>"
         )
-        if self.global_context.strip():
-            parts.append("\n\n## Global Context\n" + self.global_context.strip())
-        if self.project_context.strip():
-            parts.append("\n\n## Project Context\n" + self.project_context.strip())
-        if self.session_notes.strip():
-            parts.append("\n\n## Session Notes\n" + self.session_notes.strip())
+        has_global = bool(self.global_context.strip())
+        has_project = bool(self.project_context.strip())
+        if has_global:
+            parts.append("\n\n## Global Rules (AGENTS.md)\n" + self.global_context.strip())
+        if has_project:
+            parts.append("\n\n## Project Rules (AGENTS.md)\n" + self.project_context.strip())
+        # 全局与项目同时存在时才声明冲突裁决规则（只有一份时无从冲突）
+        if has_global and has_project:
+            parts.append(
+                "\n\nIf a project rule conflicts with a global rule, the project rule wins."
+            )
         parts.append("\n\n## Skills\n" + SkillLoader().render_catalog())
         return "".join(parts)
 
@@ -84,6 +87,11 @@ class ExecutionContext:
             last["content"].append(block)
         else:
             self.messages.append({"role": "user", "content": [block]})
+
+    # 追加一条 user 消息（loop 侧收工兜底用：提醒模型 / 系统代收结果）
+    # 刻意不改 system prompt —— system+tools 是 prompt caching 的前缀，改了会让缓存整体失效
+    def add_user_notice(self, text: str) -> None:
+        self.messages.append({"role": "user", "content": text})
 
     # 返回 True 表示 loop 应停止（状态不再是 running）
     def is_done(self) -> bool:

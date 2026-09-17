@@ -102,6 +102,29 @@ class SessionCompactResult(BaseModel):
     saved_tokens: int
 
 
+class RulesShowCommand(BaseModel):
+    type: Literal["rules.show"] = "rules.show"
+    cwd: str = ""  # 客户端工作目录绝对路径；空串回退到 daemon cwd
+
+
+class RulesFileView(BaseModel):
+    scope: str          # "global" | "project"
+    path: str
+    exists: bool
+    total_lines: int
+    total_bytes: int
+    shown_lines: int
+    content: str        # 已按预览上限截断
+    truncated: bool
+
+
+class RulesShowResult(BaseModel):
+    files: list[RulesFileView]
+    inject_line_limit: int   # 实际注入给模型的行数上限（预览上限更小，用于说明差距）
+    preview_line_limit: int
+    preview_byte_limit: int
+
+
 # 根据 type 字段决定命令类型的判别联合
 Command = Annotated[
     PingCommand
@@ -112,6 +135,7 @@ Command = Annotated[
     | SessionGetHistoryCommand
     | SessionCloseCommand
     | PermissionRespondCommand
-    | SessionCompactCommand,
+    | SessionCompactCommand
+    | RulesShowCommand,
     Discriminator("type"),
 ]

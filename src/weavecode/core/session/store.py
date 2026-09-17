@@ -15,11 +15,6 @@ MessageContent = str | list[dict[str, Any]]
 _DEFAULT_ROOT = "~/.weave/sessions"
 
 
-# 统一把 CRLF / CR 行尾折成 LF，避免会话文件混用两种行尾
-def _normalize_newlines(text: str) -> str:
-    return text.replace("\r\n", "\n").replace("\r", "\n")
-
-
 class SessionStore:
     # 初始化会话存储：根目录默认 ~/.weave/sessions，展开 ~ 并规范化成绝对路径
     def __init__(self, root: str | Path | None = None) -> None:
@@ -135,21 +130,3 @@ class SessionStore:
                     "content": msg.get("content", ""),
                 }
                 fh.write(json.dumps(row, ensure_ascii=False) + "\n")
-
-    # 读取会话笔记；文件不存在时返回空字符串
-    def read_notes(self, sid: str) -> str:
-        path = self.session_dir(sid) / "notes.md"
-        if not path.exists():
-            return ""
-        return path.read_text(encoding="utf-8").strip()
-
-    # 追加一条会话笔记：带时间戳与 run 归属的小节，写进 notes.md
-    def append_note(self, sid: str, title: str, content: str, run_id: str = "") -> None:
-        directory = self.session_dir(sid)
-        directory.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now(UTC).isoformat()
-        attribution = f"<!-- {stamp}" + (f" run={run_id}" if run_id else "") + " -->"
-        heading = _normalize_newlines(title).strip() or "note"
-        body = _normalize_newlines(content).strip()
-        with (directory / "notes.md").open("a", encoding="utf-8", newline="\n") as fh:
-            fh.write(f"\n{attribution}\n## {heading}\n\n{body}\n")
