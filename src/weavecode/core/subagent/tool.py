@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel
 
-from weavecode.core.agents import AgentProfile, AgentProfileLoader
 from weavecode.core.bus.events import SubagentFinishedEvent, SubagentStartedEvent
 from weavecode.core.context import ExecutionContext
 from weavecode.core.events.bus import EventBus
@@ -14,7 +14,6 @@ from weavecode.core.events.writer import EventWriter
 from weavecode.core.loop import AgentLoop
 from weavecode.core.runs import new_run_id
 from weavecode.core.tools.base import BaseTool, ToolResult
-from weavecode.core.tools.builtin import BashTool, ListDirTool, ReadFileTool, WriteFileTool
 from weavecode.core.tools.registry import ToolRegistry
 
 if TYPE_CHECKING:
@@ -29,8 +28,6 @@ def _now() -> str:
 class SpawnAgentParams(BaseModel):
     description: str
     prompt: str
-    # 角色名：按角色配置加载系统提示与工具白名单，留空用主 Agent 的默认提示
-    subagent_type: str = ""
 
 
 # 在隔离的冷启动上下文中派生子 agent，恒阻塞等结果
@@ -55,8 +52,6 @@ class SpawnAgentTool(BaseTool):
         "- To run several sub-agents in parallel, issue MULTIPLE spawn_agent tool calls "
         "in a single tool-calling step (one call per sub-task). The system executes them "
         "concurrently. Do NOT wait for one to finish before issuing the next.\n"
-        "- subagent_type picks the role profile (its own system prompt and tool "
-        "whitelist). Use it to get a read-only planner or reviewer.\n"
         "- The sub-agent starts with a clean context containing ONLY the provided prompt "
         "- it does NOT inherit the current conversation history. Be explicit and "
         "self-contained in prompt.\n"
@@ -78,19 +73,15 @@ class SpawnAgentTool(BaseTool):
                     "The sub-agent cannot see the parent conversation, so be explicit."
                 ),
             },
-            "subagent_type": {
-                "type": "string",
-                "description": (
-                    "Role profile of the sub-agent (e.g. planner / executor / reviewer). "
-                    "Empty uses the default profile-less sub-agent."
-                ),
-            },
         },
         "required": ["description", "prompt"],
     }
     params_model = SpawnAgentParams
 
     # 构造派生工具：只有主 Agent 持有它，层级固定为主、子两级
+    #
+    # 子 Agent 的工具集由 child_tools 工厂决定 —— 主 Agent 与子 Agent 共用同一份工具定义，
+    # 唯一差别是计划存储（主落盘、子不落盘），从根上避免两处清单打架。
     def __init__(
         self,
         provider: LLMProvider,
@@ -100,6 +91,10 @@ class SpawnAgentTool(BaseTool):
         max_steps: int,
         session_id: str,
         runs_dir: Path,
+        working_dir: str = "",
+        *,
+        child_tools: Callable[[], list[BaseTool]],
+        mcp_tools: Sequence[BaseTool] | None = None,
     ) -> None:
         self._provider = provider
         self._parent_bus = parent_bus
@@ -108,28 +103,25 @@ class SpawnAgentTool(BaseTool):
         self._max_steps = max_steps
         self._session_id = session_id
         self._runs_dir = runs_dir
-        self._profile_loader = AgentProfileLoader()
+        self._working_dir = working_dir
+        self._child_tools = child_tools
+        self._mcp_tools = list(mcp_tools or [])
 
     # 派生子 agent 并等它跑完，结果作为工具输出返回
     async def invoke(self, params: dict[str, object]) -> ToolResult:
         p = SpawnAgentParams.model_validate(params)
-        profile = self._profile_loader.resolve(p.subagent_type) if p.subagent_type else None
         child_run_id = new_run_id()
         child_context = ExecutionContext(
             run_id=child_run_id,
             goal=p.prompt,
             max_steps=self._max_steps,
-            system_prompt_override=profile.system_prompt if profile else None,
+            working_dir=self._working_dir,
         )
-        return await self._run_child(child_run_id, child_context, p, profile)
+        return await self._run_child(child_run_id, child_context, p)
 
     # 跑一个子 Agent：冷启动上下文 + 事件桥接 + 写事件文件，返回它的结果
     async def _run_child(
-        self,
-        child_run_id: str,
-        child_context: ExecutionContext,
-        p: SpawnAgentParams,
-        profile: AgentProfile | None,
+        self, child_run_id: str, child_context: ExecutionContext, p: SpawnAgentParams
     ) -> ToolResult:
         child_bus = EventBus()
 
@@ -139,13 +131,14 @@ class SpawnAgentTool(BaseTool):
 
         child_bus.subscribe(_bridge)
 
-        child_registry = self._build_child_registry(profile)
+        child_registry = self._build_child_registry()
         child_loop = AgentLoop(
             self._provider,
             child_registry,
             child_bus,
             permission_manager=self._permission_manager,
             session_id=self._session_id,
+            working_dir=self._working_dir,
         )
 
         await self._parent_bus.publish(
@@ -181,11 +174,11 @@ class SpawnAgentTool(BaseTool):
             error_type="runtime_error",
         )
 
-    # 构造子 Agent 的注册表：只给内置工具（不含派生与结果查询），再按角色白名单过滤
-    def _build_child_registry(self, profile: AgentProfile | None) -> ToolRegistry:
-        allowed = set(profile.allowed_tools) if profile and profile.allowed_tools else None
+    # 构造子 Agent 的 registry：与主 Agent 同一份工具定义 + MCP 工具；不含 spawn_agent
+    def _build_child_registry(self) -> ToolRegistry:
         registry = ToolRegistry()
-        for tool in (ReadFileTool(), BashTool(), WriteFileTool(), ListDirTool()):
-            if allowed is None or tool.name in allowed:
-                registry.register(tool)
+        for tool in self._child_tools():
+            registry.register(tool)
+        for mcp_tool in self._mcp_tools:
+            registry.register(mcp_tool)
         return registry
