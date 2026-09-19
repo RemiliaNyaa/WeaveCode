@@ -4,6 +4,7 @@ from pathlib import Path
 
 from weavecode.core.permissions.paths import normalize_path
 from weavecode.core.permissions.shell_parse import (
+    command_tokens,
     iter_command_nodes,
     node_text,
     parse,
@@ -13,13 +14,22 @@ from weavecode.core.permissions.shell_parse import (
 # 「参数是文件/目录路径」的命令白名单（对齐 opencode 的 FILES/CMD_FILES，并补齐读类命令）
 _PATH_COMMANDS: frozenset[str] = frozenset({
     # 目录切换
-    "cd", "pushd", "popd",
+    "cd", "chdir", "pushd", "popd", "push-location", "set-location",
     # 读取类（本项目的重点：避免模型读到工作目录外的内容）
     "cat", "head", "tail", "less", "more", "bat", "nl", "tac",
-    "ls", "tree", "find", "fd", "du", "stat", "file", "wc", "diff", "cmp",
+    "ls", "dir", "tree", "find", "fd", "du", "stat", "file", "wc", "diff", "cmp",
     "grep", "egrep", "fgrep", "rg", "ag", "ack",
+    "get-content", "type",
     # 写入/移动类
     "rm", "cp", "mv", "mkdir", "touch", "chmod", "chown", "ln", "rmdir",
+    "copy", "move", "rename", "del", "erase", "rd", "md",
+    "set-content", "add-content", "copy-item", "move-item", "remove-item",
+    "new-item", "rename-item",
+})
+
+# 出现在路径参数位置时需要跳过的节点类型（非路径语义的语法节点）
+_IGNORED_NODE_TYPES: frozenset[str] = frozenset({
+    "file_descriptor", "heredoc_body", "comment",
 })
 
 
@@ -31,13 +41,13 @@ def extract_shell_paths(command: str, working_dir: str) -> list[str]:
 
     out: list[str] = []
     for cmd_node in iter_command_nodes(root):
-        if not cmd_node.children:
-            continue
-        name = node_text(cmd_node.children[0]).lower()
+        name = command_tokens(cmd_node)[0].lower() if cmd_node.children else ""
         name = name.rsplit("/", 1)[-1]
         if name not in _PATH_COMMANDS:
             continue
         for arg_node in cmd_node.children[1:]:
+            if arg_node.type in _IGNORED_NODE_TYPES:
+                continue
             raw = node_text(arg_node)
             if not raw or raw.startswith("-"):
                 continue

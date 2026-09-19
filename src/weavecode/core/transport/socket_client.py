@@ -6,9 +6,11 @@ import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from weavecode.core.bus.envelope import JsonRpcRequest
+
 type EventHandler = Callable[[dict[str, Any]], Awaitable[None]]
 
-_MAX_LINE_BYTES = 1024 * 1024  # 单行帧上限 1 MB
+_MAX_LINE_BYTES = 64 * 1024 * 1024  # 64 MB per frame，兼容 MCP 大文件工具结果
 
 
 class IpcError(RuntimeError):
@@ -36,7 +38,10 @@ class SocketClient:
     async def close(self) -> None:
         if self._writer is not None:
             self._writer.close()
-            await self._writer.wait_closed()
+            try:
+                await asyncio.wait_for(self._writer.wait_closed(), timeout=1.0)
+            except TimeoutError:
+                pass
 
     # 注册服务器推送事件的回调，可多次调用以添加多个 handler
     def on_event(self, handler: EventHandler) -> None:
@@ -47,10 +52,10 @@ class SocketClient:
         if self._writer is None:
             raise RuntimeError("not connected — call connect() first")
         req_id = str(uuid.uuid4())
+        request = JsonRpcRequest(id=req_id, method=method, params=params)
         fut: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self._pending[req_id] = fut
-        payload = json.dumps({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params})
-        self._writer.write(payload.encode() + b"\n")
+        self._writer.write(request.model_dump_json().encode() + b"\n")
         await self._writer.drain()
         return await fut
 
@@ -60,7 +65,13 @@ class SocketClient:
             raise RuntimeError("not connected — call connect() first")
         try:
             while True:
-                line = await self._reader.readline()
+                try:
+                    line = await self._reader.readline()
+                except (ConnectionResetError, OSError):
+                    break
+                except (ValueError, asyncio.LimitOverrunError):
+                    # 单行超出 limit；丢弃本行，继续读取后续消息
+                    continue
                 if not line:
                     break
                 await self._dispatch(line)
@@ -93,7 +104,3 @@ class SocketClient:
             event_data: dict[str, Any] = msg.get("event", {})
             for handler in self._event_handlers:
                 await handler(event_data)
-        elif "type" in msg:
-            # 早期推送没有信封，直接是一条事件
-            for handler in self._event_handlers:
-                await handler(msg)

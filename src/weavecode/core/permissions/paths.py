@@ -51,9 +51,7 @@ def extract_paths(tool_name: str, params: dict[str, Any], working_dir: str) -> l
         if not isinstance(command, str) or not command:
             return []
         from weavecode.core.permissions.shell_paths import extract_shell_paths
-        found = extract_shell_paths(command, working_dir)
-        # 语法树一个路径都没取到时，退回按分词扫一遍
-        return found or _split_paths(command, working_dir)
+        return extract_shell_paths(command, working_dir)
 
     raw: list[str] = []
     for key in _PATH_PARAM_KEYS:
@@ -68,18 +66,3 @@ def extract_paths(tool_name: str, params: dict[str, Any], working_dir: str) -> l
         if norm not in seen:
             seen.append(norm)
     return seen
-
-
-# 按空白切开命令串，把形似路径的词按工作目录归一化后返回
-def _split_paths(command: str, working_dir: str) -> list[str]:
-    out: list[str] = []
-    for token in command.split():
-        if token.startswith(("-", "$", "`", "|", ";")):
-            continue
-        bare = token.strip("'\"")
-        if "/" not in bare and not bare.startswith("~"):
-            continue
-        norm = normalize_path(bare, working_dir)
-        if norm not in out:
-            out.append(norm)
-    return out

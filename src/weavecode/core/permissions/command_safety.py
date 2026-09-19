@@ -47,19 +47,23 @@ _UNSAFE_FIND_FLAGS: frozenset[str] = frozenset({
 # 写文件的重定向操作符（覆盖任意文件）
 _WRITE_REDIRECT_OPS: frozenset[str] = frozenset({">", ">>", "&>", "&>>", ">|"})
 
+_MAX_DEPTH = 5
+
 
 # 判断整条 bash 命令是否命中危险黑名单
 def is_dangerous_command(command: str) -> bool:
-    return _is_dangerous(command)
+    return _is_dangerous(command, 0)
 
 
 # 递归判定：遍历所有 command 节点 + 所有写文件重定向
-def _is_dangerous(command: str) -> bool:
+def _is_dangerous(command: str, depth: int) -> bool:
+    if depth > _MAX_DEPTH:
+        return True  # 嵌套过深 → 保守判危险
     root = parse(command)
     if root is None:
         return False
     for cmd_node in iter_command_nodes(root):
-        if _command_node_is_dangerous(cmd_node):
+        if _command_node_is_dangerous(cmd_node, depth):
             return True
     for node in iter_nodes_of_type(root, frozenset({"file_redirect"})):
         if _is_dangerous_redirect(node):
@@ -68,7 +72,7 @@ def _is_dangerous(command: str) -> bool:
 
 
 # 判定单个 command 节点是否危险（含透明前缀剥离与 shell 启动器递归）
-def _command_node_is_dangerous(cmd_node: Node) -> bool:
+def _command_node_is_dangerous(cmd_node: Node, depth: int) -> bool:
     name = command_name(cmd_node)
     if not name:
         return False
@@ -77,9 +81,9 @@ def _command_node_is_dangerous(cmd_node: Node) -> bool:
     if name in _DANGEROUS_COMMANDS or name.startswith("mkfs"):
         return True
     if name in _TRANSPARENT_WRAPPERS:
-        return _is_dangerous(" ".join(_strip_wrapper_args(args)))
+        return _is_dangerous(" ".join(_strip_wrapper_args(args)), depth + 1)
     if name in _SHELL_LAUNCHERS:
-        return _shell_launcher_is_dangerous(args)
+        return _shell_launcher_is_dangerous(args, depth)
     if name == "rm":
         return any(_is_force_flag(a) for a in args)
     if name == "find":
@@ -125,19 +129,25 @@ def _strip_wrapper_args(args: list[str]) -> list[str]:
 
 
 # shell 启动器：取出 -c / -Command 后的脚本文本递归判定
-def _shell_launcher_is_dangerous(args: list[str]) -> bool:
+def _shell_launcher_is_dangerous(args: list[str], depth: int) -> bool:
     for i, arg in enumerate(args):
         if arg.lower() in _SHELL_SCRIPT_FLAGS and i + 1 < len(args):
             inner = unquote(args[i + 1])
-            if inner and _is_dangerous(inner):
+            if inner and _is_dangerous(inner, depth + 1):
                 return True
     return False
 
 
-# 判定一条 file_redirect 是否是「写文件」重定向
+# 判定一条 file_redirect 是否是「写文件」（排除 2>&1、>/dev/null 这类无害重定向）
 def _is_dangerous_redirect(node: Node) -> bool:
     text = node_text(node).strip()
     if not text:
         return False
-    op = text.split(None, 1)[0]
-    return op in _WRITE_REDIRECT_OPS
+    parts = text.split(None, 1)
+    op = parts[0].lstrip("0123456789")  # 去掉 fd 前缀：2> → >
+    if op not in _WRITE_REDIRECT_OPS:
+        return False
+    target = parts[1].strip() if len(parts) > 1 else ""
+    if not target or target.startswith("&"):
+        return False
+    return target != "/dev/null"
