@@ -10,8 +10,12 @@ from collections.abc import AsyncGenerator
 
 import pytest
 
-# daemon 启动超时（秒）：留足依赖导入与连接探测的时间
-_DAEMON_START_TIMEOUT_S = 5.0
+# daemon 启动超时。取值比"干净环境"需要的（约 1s）宽松很多，因为：
+#   ① daemon 自身要 import anthropic / mcp / tree-sitter，约 2s；
+#   ② 部分机器（Windows + WSL/Hyper-V/安全软件）上，连一个「没人监听的本地端口」
+#      要等约 2s 才返回 ConnectionRefusedError，而不是瞬时拒绝——这会让
+#      SocketServer.start() 的探活、以及本 fixture 的轮询都变慢。
+_DAEMON_START_TIMEOUT_S = 15.0
 
 
 @pytest.fixture

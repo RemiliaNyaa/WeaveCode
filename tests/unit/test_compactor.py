@@ -86,6 +86,27 @@ def test_compact_replaces_context_messages(tmp_path: Path) -> None:
     assert ctx.messages[1]["role"] == "assistant"
 
 
+
+# 功能：验证 compact() 成功后发布 ContextCompactedEvent 事件
+# 设计：订阅 EventBus，收集事件，断言收到类型为 context.compacted 的事件
+def test_compact_publishes_event(tmp_path: Path) -> None:
+    provider = _stub_provider()
+    bus = EventBus()
+    received: list[Any] = []
+
+    async def handler(event: Any) -> None:
+        received.append(event)
+
+    bus.subscribe(handler)
+    compactor = Compactor(bus, tmp_path, "sess-1")
+    ctx = ExecutionContext(run_id="r1", goal="test", max_steps=5)
+    ctx.messages = _make_messages()
+
+    asyncio.get_event_loop().run_until_complete(compactor.compact(ctx, provider))
+
+    types = [getattr(e, "type", None) for e in received]
+    assert "context.compacted" in types
+
 # 功能：验证 provider 抛异常时 context.messages 保持不变
 # 设计：stub provider.chat 抛 RuntimeError，断言 compact() 返回 None 且 messages 未被修改
 def test_compact_failure_preserves_context(tmp_path: Path) -> None:
