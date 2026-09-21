@@ -187,6 +187,7 @@ class SubagentStartedEvent(BaseModel):
     type: Literal["subagent.started"] = "subagent.started"
     run_id: str          # 子 agent run_id
     parent_run_id: str
+    description: str
     ts: str
 
 
@@ -194,6 +195,7 @@ class SubagentFinishedEvent(BaseModel):
     type: Literal["subagent.finished"] = "subagent.finished"
     run_id: str
     parent_run_id: str
+    status: str          # "success" | "failed"
     ts: str
 
 

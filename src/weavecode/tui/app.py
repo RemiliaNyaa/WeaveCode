@@ -3,54 +3,33 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
+from pathlib import Path
 from typing import Any
 
-log = logging.getLogger(__name__)
-
 from rich.markdown import Markdown
+from rich.markup import escape
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import VerticalScroll
 from textual.css.query import NoMatches
 from textual.message import Message
+from textual.theme import Theme
 from textual.widget import Widget
 from textual.widgets import Label, Static, TextArea
 
+from weavecode.core.config import WeaveConfig
 from weavecode.core.skills.loader import SkillLoader
 from weavecode.core.transport.socket_client import IpcError, SocketClient
 
-# 输入框解锁后的边框标题
-_PROMPT_HINT = "type a message — enter to send, ⌘/⇧/⌥+enter for newline"
-
-# 字段收敛前后的名字对照：老字段名进、统一后的新字段名出
-_FIELD_ALIASES: dict[str, str] = {
-    "run": "run_id",
-    "tool": "tool_name",
-    "text": "token",
-    "elapsed": "elapsed_ms",
-    "error": "error_message",
-    "timestamp": "ts",
-}
+log = logging.getLogger(__name__)
 
 
 def _preview(s: str, n: int) -> str:
     return s[:n] + "…" if len(s) > n else s
 
 
-# 从会话历史的消息内容里取出可展示的纯文本
-def _message_text(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for block in content:
-            if isinstance(block, str):
-                parts.append(block)
-            elif isinstance(block, dict) and block.get("type") == "text":
-                parts.append(str(block.get("text", "")))
-        return "\n".join(parts)
-    return ""
 
 
 def _params_str(params: dict[str, Any]) -> str:
@@ -64,7 +43,6 @@ def _param_summary(tool_name: str, params: dict[str, Any], max_len: int = 72) ->
         "write_file": ("path",),
         "list_dir": ("path", "max_depth"),
         "bash": ("command",),
-        "note_save": ("title",),
     }
     keys = keys_by_tool.get(tool_name, ())
     parts = [f"{key}={params[key]!r}" for key in keys if key in params]
@@ -84,14 +62,14 @@ class LLMStreamBlock(Static):
         self._text = ""
         self._finalized = False
 
-    # 追加一个 token，流式期间只原地更新纯文本
+    # 追加一个 token 并刷新显示
     def append_token(self, token: str) -> None:
         if self._finalized:
             return
         self._text += token
         self.update(self._text)
 
-    # 块结束时才把累积文本渲染成 Markdown
+    # 将累积文本渲染为 Markdown，供流式块结束后显示
     def finalize_markdown(self) -> None:
         if self._finalized:
             return
@@ -105,6 +83,7 @@ class ToolCallBlock(Widget):
 
     DEFAULT_CSS = """
     ToolCallBlock { height: auto; padding: 0 2; color: $text-muted; }
+    ToolCallBlock > .summary { color: $text-muted; }
     ToolCallBlock > .detail { display: none; padding: 0 2 0 4; color: $text-muted; }
     ToolCallBlock.expanded > .detail { display: block; }
     """
@@ -124,7 +103,7 @@ class ToolCallBlock(Widget):
         yield Static(self._summary(), classes="summary")
         yield Static("", classes="detail")
 
-    # 生成折叠状态下的一行摘要
+    # 生成摘要行文本
     def _summary(self) -> str:
         params_pre = _param_summary(self._tool_name, self._params)
         line = f"  [dim]tool[/dim] [bold]{self._tool_name}[/bold]"
@@ -133,14 +112,11 @@ class ToolCallBlock(Widget):
         if self._finished:
             color = "red" if self._is_error else "green"
             status = "failed" if self._is_error else "done"
-            if self._tool_name == "note_save" and not self._is_error:
-                status = "remembered"
-                color = "green"
             hint = "  [dim](click to expand)[/dim]" if self._output else ""
             line += f"  [{color}]{status}[/{color}]  [dim]{self._elapsed_ms}ms[/dim]{hint}"
         return line
 
-    # 调用结束时写入结果并刷新摘要行
+    # 工具调用完成时更新结果并刷新摘要（widget 未挂载时跳过 DOM 更新）
     def set_result(self, output: str, elapsed_ms: int, *, is_error: bool = False) -> None:
         self._output = output
         self._elapsed_ms = elapsed_ms
@@ -149,7 +125,7 @@ class ToolCallBlock(Widget):
         if self.children:
             self.query_one(".summary", Static).update(self._summary())
 
-    # 点击时在折叠与展开之间切换
+    # 点击时切换展开/折叠状态
     def on_click(self) -> None:
         if not self._finished:
             return
@@ -165,48 +141,8 @@ class ToolCallBlock(Widget):
             self.add_class("expanded")
 
 
-class TaskListBlock(Static):
-    """日志流里的任务列表：任务创建与状态变化都在这一块里就地更新。"""
-
-    DEFAULT_CSS = "TaskListBlock { height: auto; padding: 0 2; color: $text-muted; }"
-
-    _MARKS: dict[str, str] = {
-        "pending": "[dim]○[/dim]",
-        "in_progress": "[yellow]◐[/yellow]",
-        "completed": "[green]●[/green]",
-        "cancelled": "[dim]⊗[/dim]",
-    }
-
-    # 初始化空任务列表
-    def __init__(self) -> None:
-        super().__init__("")
-        self._tasks: list[dict[str, str]] = []
-
-    # 追加一个新任务，状态从 pending 开始
-    def add_task(self, subject: str) -> None:
-        self._tasks.append({"subject": subject, "status": "pending"})
-        self._redraw()
-
-    # 按任务编号更新状态，编号从 1 开始
-    def set_status(self, task_id: int, status: str) -> None:
-        index = task_id - 1
-        if 0 <= index < len(self._tasks):
-            self._tasks[index]["status"] = status
-            self._redraw()
-
-    # 重新排版整个任务列表
-    def _redraw(self) -> None:
-        if not self._tasks:
-            return
-        lines = ["[bold cyan]tasks[/bold cyan]"]
-        for i, task in enumerate(self._tasks, start=1):
-            mark = self._MARKS.get(task["status"], "[dim]?[/dim]")
-            lines.append(f"  {i}. {mark} {task['subject']}")
-        self.update("\n".join(lines))
-
-
 class PermissionSelect(Static):
-    """内联权限选择控件：挂载在日志流里，键盘焦点无需 ModalScreen。"""
+    """内联权限选择控件：挂载在日志流中，键盘焦点无需 ModalScreen。"""
 
     can_focus = True
 
@@ -219,37 +155,57 @@ class PermissionSelect(Static):
     """
 
     _CHOICES: tuple[tuple[str, str, str], ...] = (
-        ("allow_once", "Allow once", "y / 1"),
+        ("allow_once",   "Allow once",   "y / 1"),
         ("always_allow", "Always allow", "a / 2"),
-        ("reject_once", "Reject", "n / 3"),
+        ("reject_once",  "Reject",       "n / 3"),
     )
     _KEY_MAP: dict[str, str] = {
-        "y": "allow_once",
-        "1": "allow_once",
-        "a": "always_allow",
-        "2": "always_allow",
-        "n": "reject_once",
-        "3": "reject_once",
+        "y": "allow_once",  "1": "allow_once",
+        "a": "always_allow","2": "always_allow",
+        "n": "reject_once", "3": "reject_once",
     }
 
     # 用户作出权限决策时发布，携带工具 ID 和决策字符串
     class Decided(Message):
+        # 初始化决策消息，存储控件引用、工具 ID 和决策
         def __init__(self, widget: PermissionSelect, tool_use_id: str, decision: str) -> None:
             self.widget = widget
             self.tool_use_id = tool_use_id
             self.decision = decision
             super().__init__()
 
-    # 初始化控件，存储工具 ID（用于 IPC 回执）
+    # 初始化控件，存储工具 ID（用于 IPC 回复）
     def __init__(self, tool_use_id: str) -> None:
         super().__init__("")
         self._tool_use_id = tool_use_id
         self._cursor = 0
 
-    # 挂载后渲染选项并把键盘焦点抢过来
     def on_mount(self) -> None:
         self.update(self._render_ui())
         self.focus()
+        log.debug(
+            "PermissionSelect.on_mount  can_focus=%s  focused_after=%r",
+            self.can_focus,
+            self.app.focused,
+        )
+        self.app.call_after_refresh(self._log_deferred_focus)
+
+    # 在下一帧记录焦点是否真正转移到本控件
+    def _log_deferred_focus(self) -> None:
+        log.debug(
+            "PermissionSelect.deferred_focus  app.focused=%r  has_focus=%s  focusable=%s",
+            self.app.focused,
+            self.has_focus,
+            self.focusable,
+        )
+
+    # 焦点到达时记录，用于确认 focus() 是否真正生效
+    def on_focus(self, event: events.Focus) -> None:
+        log.debug("PermissionSelect.on_focus  has_focus=%s  app.focused=%r", self.has_focus, self.app.focused)
+
+    # 焦点离开时记录，用于追踪是否被其他控件抢走焦点
+    def on_blur(self, event: events.Blur) -> None:
+        log.debug("PermissionSelect.on_blur  app.focused=%r", self.app.focused)
 
     # 生成带光标高亮的选项列表文本
     def _render_ui(self) -> str:
@@ -264,6 +220,7 @@ class PermissionSelect(Static):
 
     # 方向键导航；快捷键直接选择；enter 确认光标位置
     def on_key(self, event: events.Key) -> None:
+        log.debug("PermissionSelect.on_key  key=%r  char=%r", event.key, event.character)
         key = event.key
         if key in ("up", "k"):
             event.stop()
@@ -282,8 +239,9 @@ class PermissionSelect(Static):
                 event.stop()
                 self._pick(decision)
 
-    # 发布决策消息，由宿主 App 负责 IPC 回执和控件清理
+    # 发布决策消息，由宿主 App 负责 IPC 回复和控件清理
     def _pick(self, decision: str) -> None:
+        log.debug("PermissionSelect._pick  decision=%s", decision)
         self.post_message(self.Decided(self, self._tool_use_id, decision))
 
 
@@ -291,11 +249,12 @@ class PermissionBlock(Static):
     """日志里的权限审批摘要"""
 
     _LABEL_MAP: dict[str, str] = {
-        "allow_once": "allowed (once)",
+        "allow_once":   "allowed (once)",
         "always_allow": "always allowed",
-        "reject_once": "rejected",
-        "timeout": "timed out",
+        "reject_once":  "rejected",
+        "timeout":      "⏱ timed out",
     }
+    LABEL_MAP = _LABEL_MAP
 
     # 子类提交消息：用户作出权限决策时发布
     class Resolved(Message):
@@ -348,6 +307,7 @@ class SlashCompleteWidget(Static):
 
     # 用户选中某条命令时发布
     class Selected(Message):
+        # 初始化，携带被选中的 skill 名称
         def __init__(self, skill_name: str) -> None:
             self.skill_name = skill_name
             super().__init__()
@@ -434,7 +394,7 @@ class ChatTextArea(TextArea):
             self.value = area.text
             super().__init__()
 
-    # 输入内容以 / 开头且无空格时发布，query 为 / 之后的字符串；None 表示收起弹窗
+    # 输入内容以 / 开头且无空格时发布，query 为 / 之后的字符串（可为空串）；None 表示收起弹窗
     class SlashChanged(Message):
         def __init__(self, query: str | None) -> None:
             self.query = query
@@ -448,7 +408,7 @@ class ChatTextArea(TextArea):
         else:
             self.post_message(ChatTextArea.SlashChanged(query=None))
 
-    # Enter 提交；↑↓/Tab/Esc 路由到自动补全弹窗；Cmd/Shift/Alt+Enter 插入换行
+    # Enter 提交；↑↓/Tab/Esc 路由到自动补全弹窗；Cmd/Shift/Alt+Enter 插入换行；其余键交回 TextArea
     async def _on_key(self, event: events.Key) -> None:
         key = event.key
 
@@ -497,11 +457,39 @@ class ChatTextArea(TextArea):
         await super()._on_key(event)
 
 
+# WeaveCode 橙色主题：以橙色为主色/强调色，替代 Textual 默认的蓝色基调
+WEAVE_THEME = Theme(
+    name="weave",
+    primary="#E8590C",
+    secondary="#FFB066",
+    accent="#FF8C00",
+    warning="#FFB000",
+    error="#E5484D",
+    success="#46A758",
+    foreground="#F2E9E4",
+    background="#1B1613",
+    surface="#2A211C",
+    panel="#332922",
+    dark=True,
+)
+
+
+# run 失败原因的显示文案：把内部 reason 码翻成可读文本，让 TUI 说清「这次是怎么中断的」
+_RUN_FAIL_REASONS: dict[str, str] = {
+    "exceeded_max_steps": "超出步数上限",
+    "repeat_loop": "重复调用死循环",
+    "llm_error": "LLM 调用失败",
+    "cancelled": "已取消",
+}
+
+
 class WeaveTuiApp(App[None]):
     """WeaveCode TUI：终端滚屏风格，实时展示 agent 执行过程。"""
 
     TITLE = "WeaveCode"
-    BINDINGS = [Binding("ctrl+q", "quit", "quit")]
+    BINDINGS = [
+        Binding("ctrl+q", "quit", "quit"),
+    ]
     CSS = """
     Screen { background: $background; }
     #header {
@@ -515,14 +503,25 @@ class WeaveTuiApp(App[None]):
         scrollbar-size-vertical: 1;
         scrollbar-size-horizontal: 1;
     }
+    #banner { padding: 1 2 0 2; }
+    Static.user-turn { color: $text; padding: 1 2 0 2; }
     Static.run-header { color: $text-muted; padding: 1 2 0 2; }
     Static.step-divider { color: $text-muted; padding: 0 2; }
     Static.run-ok { color: green; padding: 0 2 1 2; }
     Static.run-err { color: red; padding: 0 2 1 2; }
     Static.usage { padding: 0 2; }
     Static.log-line { padding: 0 2; }
-    Static.user-turn { color: $text; padding: 1 2 0 2; }
     """
+
+    _BANNER = (
+        "[bold #FF8C00]██╗    ██╗███████╗ █████╗ ██╗   ██╗███████╗ ██████╗ ██████╗ ██████╗ ███████╗[/bold #FF8C00]\n"
+        "[bold #FF8C00]██║    ██║██╔════╝██╔══██╗██║   ██║██╔════╝██╔════╝██╔═══██╗██╔══██╗██╔════╝[/bold #FF8C00]\n"
+        "[bold #FF8C00]██║ █╗ ██║█████╗  ███████║██║   ██║█████╗  ██║     ██║   ██║██████╔╝█████╗  [/bold #FF8C00]\n"
+        "[bold #FF8C00]██║███╗██║██╔══╝  ██╔══██║╚██╗ ██╔╝██╔══╝  ██║     ██║   ██║██╔══██╗██╔══╝  [/bold #FF8C00]\n"
+        "[bold #FF8C00]╚███╔███╔╝███████╗██║  ██║ ╚████╔╝ ███████╗╚██████╗╚██████╔╝██║  ██║███████╗[/bold #FF8C00]\n"
+        "[bold #FF8C00] ╚══╝╚══╝ ╚══════╝╚═╝  ╚═╝  ╚═══╝  ╚══════╝ ╚═════╝ ╚═════╝ ╚═╝  ╚═╝╚══════╝[/bold #FF8C00]\n"
+        "[dim]  输入消息开始对话  ·  键入 / 触发 skill  ·  Ctrl+C 退出[/dim]"
+    )
 
     # 初始化连接参数和 TUI 内部状态
     def __init__(self, host: str, port: int, replay_run_id: str | None = None) -> None:
@@ -531,15 +530,15 @@ class WeaveTuiApp(App[None]):
         self._port = port
         self._replay_run_id = replay_run_id
         self._client: SocketClient | None = None
-        self._session_id: str | None = None
-        self._busy = False
-        self._last_context_pct: float = 0.0
         self._current_llm: LLMStreamBlock | None = None
         self._pending_tool_blocks: dict[str, ToolCallBlock] = {}
         self._pending_permission_blocks: dict[str, PermissionBlock] = {}
-        self._task_list: TaskListBlock | None = None
+        self._session_id: str | None = None
+        self._busy = False
+        self._last_context_pct: float = 0.0
         self._slash_items: list[tuple[str, str]] = []
         self._subagent_run_ids: dict[str, str] = {}  # child run_id -> description（运行中）
+        self._subagent_start_times: dict[str, float] = {}  # child run_id -> start time
         self._subagent_done: list[tuple[str, str]] = []  # (description, status) 本轮已结束的
         self._header_state = "connecting"  # 最近一次 header 状态，供子 Agent 事件刷新时复用
 
@@ -548,9 +547,12 @@ class WeaveTuiApp(App[None]):
         yield VerticalScroll(id="log-view")
         yield ChatTextArea(id="prompt", show_line_numbers=False)
 
-    # 挂载后构建斜杠命令候选、锁住输入框并启动连接 worker
+    # 挂载后注册橙色主题并切换到它，再初始化斜杠命令与 socket 连接
     def on_mount(self) -> None:
+        self.register_theme(WEAVE_THEME)
+        self.theme = "weave"
         self._slash_items = self._build_slash_items()
+        self._append(Static(self._BANNER, id="banner"))
         self.run_worker(self._socket_loop(), exclusive=True, name="socket")
         prompt = self.query_one("#prompt", ChatTextArea)
         prompt.disabled = True
@@ -560,6 +562,7 @@ class WeaveTuiApp(App[None]):
     def _build_slash_items(self) -> list[tuple[str, str]]:
         items: list[tuple[str, str]] = [
             ("compact", "compress context window"),
+            ("rules", "show global + project AGENTS.md"),
         ]
         try:
             loader = SkillLoader()
@@ -572,42 +575,271 @@ class WeaveTuiApp(App[None]):
             pass
         return items
 
-    # 安全获取输入框，组件测试里未挂载时跳过 UI 操作
+    # 根据 / 前缀查询字符串挂载、更新或移除自动补全弹窗
+    def on_chat_text_area_slash_changed(self, event: ChatTextArea.SlashChanged) -> None:
+        query = event.query
+        if query is None:
+            try:
+                self.query_one(SlashCompleteWidget).remove()
+            except NoMatches:
+                pass
+            return
+        try:
+            popup = self.query_one(SlashCompleteWidget)
+            popup.set_query(query)
+        except NoMatches:
+            popup = SlashCompleteWidget(self._slash_items)
+            self.mount(popup, before="#prompt")
+            popup.set_query(query)
+
+    # 用户选中自动补全项后将 /{name} 填入输入框并移除弹窗
+    def on_slash_complete_widget_selected(self, event: SlashCompleteWidget.Selected) -> None:
+        prompt = self._prompt()
+        if prompt is not None:
+            prompt.text = f"/{event.skill_name} "
+            prompt.move_cursor(prompt.document.end)
+        try:
+            self.query_one(SlashCompleteWidget).remove()
+        except NoMatches:
+            pass
+
+    # 记录按键焦点；当 PermissionSelect 失去焦点后作为兜底处理权限快捷键
+    def on_key(self, event: events.Key) -> None:
+        log.debug("App.on_key  key=%r  focused=%r", event.key, self.focused)
+        if not self._pending_permission_blocks:
+            return
+        try:
+            select = self.query_one(PermissionSelect)
+            if select.has_focus:
+                return  # PermissionSelect 有焦点时自行处理，事件不会冒泡到这里
+            key = event.key
+            decision = PermissionSelect._KEY_MAP.get(key)
+            if decision:
+                event.stop()
+                select._pick(decision)
+            elif key in ("up", "k"):
+                event.stop()
+                select._cursor = (select._cursor - 1) % len(PermissionSelect._CHOICES)
+                select.update(select._render_ui())
+            elif key in ("down", "j"):
+                event.stop()
+                select._cursor = (select._cursor + 1) % len(PermissionSelect._CHOICES)
+                select.update(select._render_ui())
+            elif key == "enter":
+                event.stop()
+                select._pick(PermissionSelect._CHOICES[select._cursor][0])
+        except Exception:
+            pass
+
+    # 退出前尽力关闭当前 session，失败也不阻塞 TUI 退出
+    async def action_quit(self) -> None:
+        if self._client is not None and self._session_id is not None:
+            try:
+                await self._client.send_command("session.close", {"session_id": self._session_id})
+            except (IpcError, RuntimeError, OSError):
+                self._append(Static("[yellow]warning: failed to close session[/yellow]"))
+        self.exit()
+
+    # 将输入框提交内容发送给当前 chat session；用 worker 发送，避免 await 阻塞 App 消息泵
+    async def on_chat_text_area_submitted(self, event: ChatTextArea.Submitted) -> None:
+        content = event.value.strip()
+        if not content:
+            return
+        # 检测 /compact 指令
+        if content == "/compact":
+            event.text_area.text = ""
+            if self._client is not None and self._session_id is not None and not self._busy:
+                self.run_worker(self._do_compact(), name="compact", exclusive=False)
+            return
+        # 检测 /rules 指令（只读：打印全局 + 项目 AGENTS.md 预览，不占用 busy 状态）
+        if content == "/rules":
+            event.text_area.text = ""
+            if self._client is not None:
+                self.run_worker(self._do_rules(), name="rules", exclusive=False)
+            return
+        if self._client is None or self._session_id is None or self._busy:
+            self._append(Static("[yellow]agent busy or disconnected[/yellow]", classes="log-line"))
+            return
+        self._busy = True
+        prompt = event.text_area
+        prompt.text = ""
+        prompt.disabled = True
+        prompt.read_only = False
+        prompt.border_title = "agent is working..."
+        self._append(Static(f"[bold]>[/bold] {content}", classes="user-turn"))
+        self._update_header("running")
+        self.run_worker(self._do_send_message(content), name="send_message", exclusive=False)
+
+    # 在 worker 中执行手动压缩命令，完成后显示结果横幅
+    async def _do_compact(self) -> None:
+        if self._client is None or self._session_id is None:
+            return
+        self._append(Static("[dim]⚡ compacting context...[/dim]", classes="log-line"))
+        try:
+            result = await self._client.send_command(
+                "session.compact",
+                {"session_id": self._session_id, "focus": ""},
+            )
+            summary_tokens = result.get("summary_tokens", 0)
+            saved_tokens = result.get("saved_tokens", 0)
+            self._last_context_pct = 0.0
+            self._append(Static(
+                f"[bold cyan]⚡ Context compacted[/bold cyan]"
+                f"  [dim]summary={summary_tokens} tokens  saved≈{saved_tokens} tokens[/dim]",
+                classes="log-line",
+            ))
+        except (IpcError, RuntimeError, OSError) as e:
+            self._append(Static(f"[red]compact error: {e}[/red]", classes="log-line"))
+
+    # 在 worker 中打印全局与项目 AGENTS.md 预览（只读命令，不影响 agent busy 状态）
+    async def _do_rules(self) -> None:
+        if self._client is None:
+            return
+        try:
+            result = await self._client.send_command("rules.show", {"cwd": str(Path.cwd())})
+        except (IpcError, RuntimeError, OSError) as e:
+            self._append(Static(f"[red]rules error: {e}[/red]", classes="log-line"))
+            return
+
+        inject_lines = int(result.get("inject_line_limit", 0))
+        found = 0
+        for item in result.get("files") or []:
+            scope = "全局" if item.get("scope") == "global" else "项目"
+            path = str(item.get("path", ""))
+            if not item.get("exists"):
+                self._append(Static(
+                    f"[dim]── {scope} AGENTS.md ──[/dim]  [dim](不存在)[/dim]",
+                    classes="log-line",
+                ))
+                self._append(Static(f"[dim]{escape(path)}[/dim]", classes="log-line"))
+                continue
+            found += 1
+            size_kb = float(item.get("total_bytes", 0)) / 1024
+            self._append(Static(
+                f"[bold cyan]── {scope} AGENTS.md ──[/bold cyan]  "
+                f"[dim]{size_kb:.1f} KB · {item.get('total_lines', 0)} 行[/dim]",
+                classes="log-line",
+            ))
+            self._append(Static(f"[dim]{escape(path)}[/dim]", classes="log-line"))
+            if item.get("content"):
+                # 用 Markdown 渲染，避免 AGENTS.md 里的 [ ] 被当成 Rich 标记
+                self._append(Static(
+                    Markdown(str(item["content"]), code_theme="monokai"),
+                    classes="log-line",
+                ))
+            if item.get("truncated"):
+                self._append(Static(
+                    f"[yellow]── 已截断：此处显示前 {item.get('shown_lines', 0)} 行；"
+                    f"注入给模型的是前 {inject_lines} 行；全文 {escape(path)}[/yellow]",
+                    classes="log-line",
+                ))
+            self._append(Static("", classes="log-line"))
+        if found == 0:
+            self._append(Static(
+                "[dim]两份 AGENTS.md 都不存在。用 /init_rules 生成一份。[/dim]",
+                classes="log-line",
+            ))
+
+    # 在 worker 中执行 IPC 发送，使 App 消息泵在 agent 运行期间仍能处理键盘/焦点等消息
+    async def _do_send_message(self, content: str) -> None:
+        if self._client is None:
+            return
+        try:
+            await self._client.send_command(
+                "session.send_message",
+                {"session_id": self._session_id, "content": content},
+            )
+        except (IpcError, RuntimeError, OSError) as e:
+            self._busy = False
+            prompt = self._prompt()
+            if prompt is not None:
+                prompt.disabled = False
+                prompt.read_only = False
+                prompt.border_title = "type a message — enter to send, ⌘/⇧/⌥+enter for newline"
+            self._update_header("ready")
+            self._append(Static(f"[red]send error: {e}[/red]", classes="log-line"))
+
+    # 处理内联审批控件的用户决策：发送 IPC 响应并恢复输入框
+    async def on_permission_select_decided(self, msg: PermissionSelect.Decided) -> None:
+        tool_use_id = msg.tool_use_id
+        decision = msg.decision
+        log.info("permission decided tool_use_id=%s decision=%s", tool_use_id, decision)
+        try:
+            msg.widget.remove()
+            perm_block = self._pending_permission_blocks.pop(tool_use_id, None)
+            if perm_block is not None:
+                perm_block._resolve(decision)
+            if self._client is not None:
+                try:
+                    await self._client.send_command(
+                        "permission.respond",
+                        {"tool_use_id": tool_use_id, "decision": decision},
+                    )
+                except (IpcError, RuntimeError, OSError):
+                    pass
+            if not self._pending_permission_blocks:
+                p = self._prompt()
+                if p is not None:
+                    p.disabled = False
+                    p.read_only = False
+                    p.border_title = "type a message — enter to send, ⌘/⇧/⌥+enter for newline"
+                    p.focus()
+        except Exception:
+            log.exception("on_permission_select_decided failed tool_use_id=%s", tool_use_id)
+
+    # 向日志视图追加一个 widget 并滚动到底部
+    def _append(self, widget: Widget) -> None:
+        log_view = self.query_one("#log-view", VerticalScroll)
+        log_view.mount(widget)
+        log_view.scroll_end(animate=False)
+
+    # 结束当前 LLM 流式块（下一个 token 将开启新块）
+    def _break_llm(self) -> None:
+        if self._current_llm is not None:
+            self._current_llm.finalize_markdown()
+        self._current_llm = None
+
+    # 将选择控件挂载到 Screen 顶层（#prompt 之前），避免 VerticalScroll 争抢焦点
+    def _mount_permission_select(self, select: PermissionSelect) -> None:
+        self.mount(select, before="#prompt")
+
+    # 安全获取输入框，便于组件测试中未挂载时跳过 UI 操作
     def _prompt(self) -> ChatTextArea | None:
         try:
             return self.query_one("#prompt", ChatTextArea)
         except Exception:
             return None
 
-    # 向单列滚动流里挂一个 widget 并滚到底部
-    def _append(self, widget: Widget) -> None:
-        log_view = self.query_one("#log-view", VerticalScroll)
-        log_view.mount(widget)
-        log_view.scroll_end(animate=False)
+    # 生成 context 占用率的彩色进度条字符串
+    def _render_ctx_bar(self, pct: float) -> str:
+        filled = int(pct * 20)
+        bar = "█" * filled + "░" * (20 - filled)
+        label = f"ctx:{pct * 100:.1f}%"
+        if pct >= 0.85:
+            color = "bold red"
+        elif pct >= 0.70:
+            color = "yellow"
+        else:
+            color = "dim"
+        return f"[{color}]{label} {bar}[/{color}]"
 
-    # 结束当前 LLM 流式块，下一个 token 会开启新块
-    def _break_llm(self) -> None:
-        if self._current_llm is not None:
-            self._current_llm.finalize_markdown()
-            self._current_llm = None
-
-    # 根据连接与运行状态刷新顶部状态栏（尾部附带子 Agent 实时进度）
+    # 根据连接和运行状态刷新顶部标题（尾部附带子 Agent 实时进度）
     def _update_header(self, state: str) -> None:
         try:
             header = self.query_one("#header", Label)
-        except Exception:
+        except NoMatches:
             return
         self._header_state = state
+        session = f"  [dim]{self._session_id}[/dim]" if self._session_id else ""
         color = {
             "ready": "green",
             "running": "yellow",
             "disconnected": "red",
             "connecting": "dim",
         }.get(state, "dim")
-        session = f"  [dim]{self._session_id}[/dim]" if self._session_id else ""
         header.update(
-            f"[bold]WeaveCode[/bold]  [dim]{self._host}:{self._port}[/dim]{session}"
-            f"  [{color}]{state}[/{color}]{self._subagent_segment()}"
+            f"[bold]WeaveCode[/bold]  [dim]{self._host}:{self._port}[/dim]"
+            f"{session}  [{color}]{state}[/{color}]{self._subagent_segment()}"
         )
 
     # 渲染顶部标题里的子 Agent 段：│ 子 Agent 1/3  ✓ 研究A   ⏳ 研究B
@@ -627,206 +859,13 @@ class WeaveTuiApp(App[None]):
             f"  [dim]│[/dim] [yellow]子 Agent {done}/{done + running}[/yellow]  {detail}"
         )
 
-    # 生成 context 占用率的彩色进度条：70% 变黄、85% 变红
-    def _render_ctx_bar(self, pct: float) -> str:
-        filled = int(pct * 20)
-        bar = "█" * filled + "░" * (20 - filled)
-        label = f"ctx:{pct * 100:.1f}%"
-        if pct >= 0.85:
-            color = "bold red"
-        elif pct >= 0.70:
-            color = "yellow"
-        else:
-            color = "dim"
-        return f"[{color}]{label} {bar}[/{color}]"
-
-    # 惰性挂出任务列表，后续任务事件都更新这一块
-    def _tasks(self) -> TaskListBlock:
-        if self._task_list is None:
-            self._task_list = TaskListBlock()
-            self._append(self._task_list)
-        return self._task_list
-
-    # 任务工具的调用落到任务列表上：建任务、改状态就地刷新
-    def _track_task(self, tool_name: str, params: dict[str, Any]) -> None:
-        if tool_name == "task_create":
-            self._tasks().add_task(str(params.get("subject", "")))
-        elif tool_name == "task_update":
-            task_id = int(params.get("id") or 0)
-            status = str(params.get("status") or "")
-            if task_id > 0 and status:
-                self._tasks().set_status(task_id, status)
-
-    # 把会话历史排进日志流：用户消息独立成回合，助手回复渲染成 Markdown
-    def _render_history(self, messages: list[dict[str, Any]]) -> None:
-        for message in messages:
-            role = str(message.get("role", ""))
-            text = _message_text(message.get("content"))
-            if not text:
-                continue
-            if role == "user":
-                self._append(Static(f"[bold]>[/bold] {text}", classes="user-turn"))
-            elif role == "assistant":
-                self._append(Static(Markdown(text, code_theme="monokai"), classes="log-line"))
-
-    # 取回会话历史并重建画面；连接建立与会话切换共用这一步
-    async def _load_history(self, session_id: str) -> None:
-        if self._client is None:
-            return
-        try:
-            history = await self._client.send_command(
-                "session.get_history", {"session_id": session_id}
-            )
-        except (IpcError, RuntimeError, OSError) as e:
-            log.warning("load history failed session_id=%s: %s", session_id, e)
-            return
-        messages = history.get("messages") or []
-        if messages:
-            self._render_history(messages)
-
-    # 把选择控件挂到 Screen 顶层（#prompt 之前），避免 VerticalScroll 争抢焦点
-    def _mount_permission_select(self, select: PermissionSelect) -> None:
-        self.mount(select, before="#prompt")
-
-    # 全部待审批都处理完后重新解锁输入框
-    def _unlock_prompt(self) -> None:
-        if self._pending_permission_blocks:
-            return
-        prompt = self._prompt()
-        if prompt is not None:
-            prompt.disabled = False
-            prompt.read_only = False
-            prompt.border_title = _PROMPT_HINT
-            prompt.focus()
-
-    # 处理内联审批控件的用户决策：发送 IPC 回执并就地改写回执行
-    async def on_permission_select_decided(self, msg: PermissionSelect.Decided) -> None:
-        tool_use_id = msg.tool_use_id
-        decision = msg.decision
-        try:
-            msg.widget.remove()
-            perm_block = self._pending_permission_blocks.pop(tool_use_id, None)
-            if perm_block is not None:
-                perm_block._resolve(decision)
-            if self._client is not None:
-                try:
-                    await self._client.send_command(
-                        "permission.respond",
-                        {"tool_use_id": tool_use_id, "decision": decision},
-                    )
-                except (IpcError, RuntimeError, OSError):
-                    pass
-            self._unlock_prompt()
-        except Exception:
-            log.exception("permission respond failed tool_use_id=%s", tool_use_id)
-
-    # 退出前尽力关闭当前 session，失败也不阻塞 TUI 退出
-    async def action_quit(self) -> None:
-        if self._client is not None and self._session_id is not None:
-            try:
-                await self._client.send_command("session.close", {"session_id": self._session_id})
-            except (IpcError, RuntimeError, OSError):
-                self._append(Static("[yellow]warning: failed to close session[/yellow]"))
-        self.exit()
-
-    # 根据 / 前缀查询字符串挂载、更新或移除自动补全弹窗
-    def on_chat_text_area_slash_changed(self, event: ChatTextArea.SlashChanged) -> None:
-        query = event.query
-        if query is None:
-            try:
-                self.query_one(SlashCompleteWidget).remove()
-            except NoMatches:
-                pass
-            return
-        try:
-            popup = self.query_one(SlashCompleteWidget)
-            popup.set_query(query)
-        except NoMatches:
-            popup = SlashCompleteWidget(self._slash_items)
-            self.mount(popup, before="#prompt")
-            popup.set_query(query)
-
-    # 用户选中自动补全项后把 /{name} 填入输入框并移除弹窗
-    def on_slash_complete_widget_selected(self, event: SlashCompleteWidget.Selected) -> None:
-        prompt = self._prompt()
-        if prompt is not None:
-            prompt.text = f"/{event.skill_name} "
-            prompt.move_cursor(prompt.document.end)
-        try:
-            self.query_one(SlashCompleteWidget).remove()
-        except NoMatches:
-            pass
-
-    # 输入框提交：锁定输入、回显用户回合，再交给 worker 发送
-    async def on_chat_text_area_submitted(self, event: ChatTextArea.Submitted) -> None:
-        content = event.value.strip()
-        if not content:
-            return
-        # 检测 /compact 指令
-        if content == "/compact":
-            event.text_area.text = ""
-            if self._client is not None and self._session_id is not None and not self._busy:
-                self.run_worker(self._do_compact(), name="compact", exclusive=False)
-            return
-        if self._client is None or self._session_id is None or self._busy:
-            self._append(Static("[yellow]agent busy or disconnected[/yellow]", classes="log-line"))
-            return
-        self._busy = True
-        prompt = event.text_area
-        prompt.text = ""
-        prompt.disabled = True
-        prompt.read_only = False
-        prompt.border_title = "agent is working..."
-        self._append(Static(f"[bold]>[/bold] {content}", classes="user-turn"))
-        self._update_header("running")
-        self.run_worker(self._do_send_message(content), name="send_message", exclusive=False)
-
-    # 在 worker 中执行 IPC 发送，消息泵在 agent 运行期间保持畅通
-    async def _do_send_message(self, content: str) -> None:
-        if self._client is None:
-            return
-        try:
-            await self._client.send_command(
-                "session.send_message",
-                {"session_id": self._session_id, "content": content},
-            )
-        except (IpcError, RuntimeError, OSError) as e:
-            self._busy = False
-            prompt = self._prompt()
-            if prompt is not None:
-                prompt.disabled = False
-                prompt.read_only = False
-                prompt.border_title = _PROMPT_HINT
-            self._update_header("ready")
-            self._append(Static(f"[red]send error: {e}[/red]", classes="log-line"))
-
-    # 在 worker 中执行手动压缩命令，完成后显示结果横幅
-    async def _do_compact(self) -> None:
-        if self._client is None or self._session_id is None:
-            return
-        self._append(Static("[dim]compacting context...[/dim]", classes="log-line"))
-        try:
-            result = await self._client.send_command(
-                "session.compact",
-                {"session_id": self._session_id, "focus": ""},
-            )
-            summary_tokens = result.get("summary_tokens", 0)
-            saved_tokens = result.get("saved_tokens", 0)
-            self._last_context_pct = 0.0
-            self._append(Static(
-                f"[bold cyan]Context compacted[/bold cyan]"
-                f"  [dim]summary={summary_tokens} tokens  saved≈{saved_tokens} tokens[/dim]",
-                classes="log-line",
-            ))
-        except (IpcError, RuntimeError, OSError) as e:
-            self._append(Static(f"[red]compact error: {e}[/red]", classes="log-line"))
-
-    # 管理 SocketClient 生命周期：连接、订阅事件、创建会话、断线重连
+    # 管理 SocketClient 生命周期：连接、订阅事件、断线重连
     async def _socket_loop(self) -> None:
+        header = self.query_one("#header", Label)
+
         while True:
             client = SocketClient(self._host, self._port)
             self._client = None
-            self._update_header("connecting")
             try:
                 await client.connect()
             except (ConnectionRefusedError, OSError):
@@ -837,6 +876,7 @@ class WeaveTuiApp(App[None]):
 
             log.info("connected to %s:%s", self._host, self._port)
             self._client = client
+            self._update_header("connecting")
             loop_task = asyncio.create_task(client.run_event_loop())
 
             async def on_event(event: dict[str, Any]) -> None:
@@ -845,6 +885,11 @@ class WeaveTuiApp(App[None]):
             client.on_event(on_event)
 
             try:
+                loop_task.add_done_callback(
+                    lambda t: log.error("loop_task failed: %s", t.exception())
+                    if not t.cancelled() and t.exception() is not None
+                    else None
+                )
                 params: dict[str, Any] = {
                     "topics": [
                         "session.*",
@@ -853,30 +898,32 @@ class WeaveTuiApp(App[None]):
                         "tool.*",
                         "llm.token",
                         "llm.usage",
+                        "log.*",
                         "permission.*",
                         "context.*",
-                        "skill.*",
                         "subagent.*",
+                        "skill.*",
                     ],
                     "scope": "global",
                 }
                 if self._replay_run_id is not None:
                     params["replay_from_run"] = self._replay_run_id
                 await client.send_command("event.subscribe", params)
-                created = await client.send_command("session.create", {"mode": "chat"})
+                created = await client.send_command(
+                    "session.create", {"mode": "chat", "cwd": str(Path.cwd())}
+                )
                 self._session_id = str(created["session_id"])
                 log.info("session created session_id=%s", self._session_id)
-                await self._load_history(self._session_id)
                 prompt = self._prompt()
                 if prompt is not None:
                     prompt.disabled = False
                     prompt.read_only = False
-                    prompt.border_title = _PROMPT_HINT
+                    prompt.border_title = "type a message — enter to send, ⌘/⇧/⌥+enter for newline"
                     prompt.focus()
                 self._update_header("ready")
                 await loop_task
             except IpcError as e:
-                log.error("session setup failed: %s", e)
+                header.update(f"[bold]WeaveCode[/bold]  [red]subscribe error: {e}[/red]")
             finally:
                 if not loop_task.done():
                     loop_task.cancel()
@@ -893,25 +940,10 @@ class WeaveTuiApp(App[None]):
             self._update_header("disconnected")
             await asyncio.sleep(2)
 
-    # 序列化差异在分发入口抹平，下游分支只按统一后的新字段名读事件载荷
-    def _normalize_event(self, event: dict[str, Any]) -> dict[str, Any]:
-        data = event.get("data")
-        if isinstance(data, dict):
-            merged = dict(data)
-            merged.setdefault("type", event.get("type", ""))
-            event = merged
-        normalized = dict(event)
-        for old, new in _FIELD_ALIASES.items():
-            if old in normalized and new not in normalized:
-                normalized[new] = normalized.pop(old)
-        normalized.setdefault("type", "")
-        normalized.setdefault("ts", "")
-        return normalized
-
-    # 根据事件 type 路由到对应渲染逻辑；单个事件渲染失败不会掀翻 socket loop
+    # 根据事件 type 路由到对应渲染逻辑；捕获异常防止 socket loop 因单个事件崩溃
     def _handle_event(self, event: dict[str, Any]) -> None:
         try:
-            self._handle_event_inner(self._normalize_event(event))
+            self._handle_event_inner(event)
         except Exception:
             log.exception("_handle_event crashed  event_type=%s", event.get("type", "?"))
 
@@ -936,22 +968,9 @@ class WeaveTuiApp(App[None]):
             if prompt is not None:
                 prompt.disabled = False
                 prompt.read_only = False
-                prompt.border_title = _PROMPT_HINT
+                prompt.border_title = "type a message — enter to send, ⌘/⇧/⌥+enter for newline"
                 prompt.focus()
             self._update_header("ready")
-
-        elif t == "session.resumed":
-            session_id = str(event.get("session_id", ""))
-            if session_id and session_id != self._session_id:
-                self._session_id = session_id
-                self._update_header("ready")
-                self._append(Static(
-                    f"[dim]── session {session_id} ──[/dim]",
-                    classes="log-line",
-                ))
-                self.run_worker(
-                    self._load_history(session_id), name="history", exclusive=True
-                )
 
         elif t == "session.closed":
             self._busy = False
@@ -962,31 +981,14 @@ class WeaveTuiApp(App[None]):
                 prompt.border_title = "session closed"
             self._update_header("disconnected")
 
-        elif t == "permission.requested":
-            tool_use_id = str(event.get("tool_use_id", ""))
-            tool_name = str(event.get("tool_name", ""))
-            param_preview = str(event.get("param_preview", ""))
-            perm_block = PermissionBlock(tool_use_id, tool_name, param_preview)
-            self._pending_permission_blocks[tool_use_id] = perm_block
-            prompt = self._prompt()
-            if prompt is not None:
-                prompt.disabled = True
-                prompt.border_title = "permission required"
-            self._append(perm_block)
-            self._mount_permission_select(PermissionSelect(tool_use_id))
-
-        elif t == "permission.denied":
-            tool_use_id = str(event.get("tool_use_id", ""))
-            decision = str(event.get("decision", "denied"))
-            if tool_use_id in self._pending_permission_blocks:
-                perm_block = self._pending_permission_blocks.pop(tool_use_id)
-                perm_block._resolve(decision)
-                try:
-                    select = self.query_one(PermissionSelect)
-                    select.remove()
-                except Exception:
-                    pass
-                self._unlock_prompt()
+        elif t == "run.started":
+            run_id = event.get("run_id", "")
+            goal = event.get("goal", "")
+            self._subagent_done.clear()  # 新一轮开始，清空上一轮的子 Agent 进度
+            self._append(Static(
+                f"[dim]run[/dim]  [cyan]{run_id}[/cyan]  [dim]{_preview(goal, 96)}[/dim]",
+                classes="run-header",
+            ))
 
         elif t == "skill.invoked":
             skill_name = event.get("skill_name", "")
@@ -998,20 +1000,11 @@ class WeaveTuiApp(App[None]):
                 classes="log-line",
             ))
 
-        elif t == "run.started":
-            run_id = event.get("run_id", "")
-            goal = event.get("goal", "")
-            self._subagent_done.clear()  # 新一轮开始，清空上一轮的子 Agent 进度
-            self._update_header("running")
-            self._append(Static(
-                f"[dim]run[/dim]  [cyan]{run_id}[/cyan]  [dim]{_preview(goal, 96)}[/dim]",
-                classes="run-header",
-            ))
-
         elif t == "subagent.started":
             run_id = event.get("run_id", "")
-            description = str(event.get("description") or event.get("title") or "")
+            description = event.get("description", "")
             self._subagent_run_ids[run_id] = description
+            self._subagent_start_times[run_id] = time.monotonic()
             short_id = run_id[:8] if len(run_id) >= 8 else run_id
             self._append(Static(
                 f"[dim]┌─[/dim] [cyan]{_preview(description, 72)}[/cyan]  [dim]{short_id}[/dim]",
@@ -1021,12 +1014,12 @@ class WeaveTuiApp(App[None]):
 
         elif t == "subagent.finished":
             run_id = event.get("run_id", "")
-            status = str(event.get("status") or "success")
-            description = self._subagent_run_ids.pop(
-                run_id, str(event.get("description") or "")
-            )
+            status = event.get("status", "")
+            description = self._subagent_run_ids.pop(run_id, event.get("description", ""))
+            start = self._subagent_start_times.pop(run_id, None)
             self._subagent_done.append((description, status))
-            desc_part = f"[cyan]{_preview(description, 72)}[/cyan]"
+            elapsed = f"  [dim]{time.monotonic() - start:.1f}s[/dim]" if start is not None else ""
+            desc_part = f"[cyan]{_preview(description, 72)}[/cyan]{elapsed}"
             if status == "success":
                 self._append(Static(
                     f"[dim]└─[/dim] [bold green]✓[/bold green] {desc_part}",
@@ -1039,28 +1032,13 @@ class WeaveTuiApp(App[None]):
                 ))
             self._update_header(self._header_state)
 
-        elif t == "run.finished":
-            status = event.get("status", "")
-            steps = event.get("steps", 0)
-            reason = event.get("reason") or ""
-            if status == "success":
-                self._append(Static(
-                    f"[bold green]✓ completed[/bold green]  [dim]{steps} steps[/dim]",
-                    classes="run-ok",
-                ))
-            else:
-                detail = f"  [dim]{reason}[/dim]" if reason else ""
-                self._append(Static(
-                    f"[bold red]✗ failed[/bold red]{detail}  [dim]{steps} steps[/dim]",
-                    classes="run-err",
-                ))
-
         elif t == "step.started":
             run_id = event.get("run_id", "")
             if run_id in self._subagent_run_ids:
                 return
+            step = event.get("step", "")
             self._append(Static(
-                f"[dim]step {event.get('step')}[/dim]",
+                f"[dim]step {step}[/dim]",
                 classes="step-divider",
             ))
 
@@ -1069,13 +1047,12 @@ class WeaveTuiApp(App[None]):
             tool_name = str(event.get("tool_name", ""))
             params = event.get("params") or {}
             run_id = event.get("run_id", "")
-            # 子 Agent 的工具调用不展示在前台，否则每调一次工具就刷一屏
+            # 子 Agent 的工具调用不展示在前台：前台只看主 Agent 对话 + 子 Agent 状态与标题
             if run_id in self._subagent_run_ids:
                 return
             tc_block = ToolCallBlock(tool_name, params)
             self._pending_tool_blocks[tool_use_id] = tc_block
             self._append(tc_block)
-            self._track_task(tool_name, params)
 
         elif t == "tool.call_finished":
             tool_use_id = str(event.get("tool_use_id", ""))
@@ -1093,18 +1070,37 @@ class WeaveTuiApp(App[None]):
                 tc_done = self._pending_tool_blocks.pop(tool_use_id)
                 tc_done.set_result(error_msg, elapsed_ms, is_error=True)
 
+        elif t == "run.finished":
+            status = event.get("status", "")
+            steps = event.get("steps", 0)
+            reason = event.get("reason") or ""
+            if status == "success":
+                self._append(Static(
+                    f"[bold green]✓ completed[/bold green]  [dim]{steps} steps[/dim]",
+                    classes="run-ok",
+                ))
+            else:
+                # 把内部 reason 码翻成可读文本（如 repeat_loop → 重复调用死循环）
+                label = _RUN_FAIL_REASONS.get(reason, reason)
+                shown = f"{label}（{reason}）" if reason and label != reason else reason
+                detail = f"  [dim]{shown}[/dim]" if shown else ""
+                self._append(Static(
+                    f"[bold red]✗ failed[/bold red]{detail}  [dim]{steps} steps[/dim]",
+                    classes="run-err",
+                ))
+
         elif t == "llm.usage":
             run_id = event.get("run_id", "")
             if run_id in self._subagent_run_ids:
                 return
             pct = float(event.get("context_pct") or 0.0)
-            # 每次用量都取当次上报的水位，压缩之后下一次上报自然回落
             self._last_context_pct = pct
             ctx_bar = self._render_ctx_bar(pct)
             self._append(Static(
-                f"[dim]  tokens  in={event.get('input_tokens')}"
-                f" out={event.get('output_tokens')}"
-                f" cache={event.get('cache_read_input_tokens')}[/dim]"
+                f"[dim]  tokens  "
+                f"in={event.get('input_tokens')} "
+                f"out={event.get('output_tokens')} "
+                f"cache={event.get('cache_read_input_tokens')}[/dim]"
                 f"  {ctx_bar}",
                 classes="usage",
             ))
@@ -1114,7 +1110,65 @@ class WeaveTuiApp(App[None]):
             summary = event.get("summary_tokens", 0)
             self._last_context_pct = 0.0
             self._append(Static(
-                f"[bold cyan]Context compacted[/bold cyan]"
+                f"[bold cyan]⚡ Context compacted[/bold cyan]"
                 f"  [dim]original≈{orig} tokens → summary={summary} tokens[/dim]",
                 classes="log-line",
             ))
+
+        elif t == "permission.requested":
+            tool_use_id = str(event.get("tool_use_id", ""))
+            tool_name = str(event.get("tool_name", ""))
+            param_preview = str(event.get("param_preview", ""))
+            try:
+                _focused_repr = repr(self.focused)
+            except Exception:
+                _focused_repr = "?"
+            log.info(
+                "permission.requested tool=%s id=%s  app.focused=%s",
+                tool_name, tool_use_id, _focused_repr,
+            )
+            perm_block = PermissionBlock(tool_use_id, tool_name, param_preview)
+            self._pending_permission_blocks[tool_use_id] = perm_block
+            prompt = self._prompt()
+            if prompt is not None:
+                prompt.disabled = True
+                prompt.border_title = "permission required"
+            self._append(perm_block)
+            select = PermissionSelect(tool_use_id)
+            self._mount_permission_select(select)
+            log.debug("PermissionSelect mounted before #prompt  pending=%d", len(self._pending_permission_blocks))
+
+        elif t == "permission.denied":
+            # 处理超时或断连等非用户交互触发的 deny（用户主动 deny 已由 on_permission_select_decided 处理）
+            tool_use_id = str(event.get("tool_use_id", ""))
+            decision = str(event.get("decision", "denied"))
+            if tool_use_id in self._pending_permission_blocks:
+                perm_block = self._pending_permission_blocks.pop(tool_use_id)
+                perm_block._resolve(decision)
+                try:
+                    select = self.query_one(PermissionSelect)
+                    select.remove()
+                except Exception:
+                    pass
+                if not self._pending_permission_blocks:
+                    p = self._prompt()
+                    if p is not None:
+                        p.disabled = False
+                        p.read_only = False
+                        p.border_title = "type a message — enter to send, ⌘/⇧/⌥+enter for newline"
+                        p.focus()
+
+        elif t == "log.line":
+            level = event.get("level", "INFO")
+            color = "bold red" if level == "ERROR" else ("yellow" if level == "WARNING" else "dim")
+            self._append(Static(
+                f"[{color}]{level}[/{color}]  "
+                f"[dim]{event.get('source', '')}[/dim]  {event.get('message', '')}",
+                classes="log-line",
+            ))
+
+
+# TUI 入口：读取配置并启动 WeaveTuiApp
+def run(config: WeaveConfig, replay_run_id: str | None = None) -> None:
+    app = WeaveTuiApp(config.host, config.port, replay_run_id=replay_run_id)
+    app.run()

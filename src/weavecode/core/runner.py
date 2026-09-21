@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -16,21 +17,28 @@ from weavecode.core.llm.base import LLMProvider
 from weavecode.core.llm.provider import AnthropicProvider
 from weavecode.core.loop import AgentLoop
 from weavecode.core.mcp.server import McpServerManager
+from weavecode.core.memory.loader import load_rules_file
 from weavecode.core.permissions.manager import PermissionManager
 from weavecode.core.runs import RUNS_DIR, new_run_id
 from weavecode.core.session.model import Session
 from weavecode.core.session.store import SessionStore
+from weavecode.core.subagent.runs import BackgroundRuns
 from weavecode.core.subagent.tool import SpawnAgentTool
+from weavecode.core.subagent.wait_tool import WaitAgentTool
+from weavecode.core.tools.base import BaseTool
 from weavecode.core.trace.provider import TracingProvider
 from weavecode.core.trace.writer import TraceWriter
 from weavecode.core.tools.builtin import (
     BashTool,
+    GlobTool,
+    GrepTool,
     ListDirTool,
     ReadFileTool,
     WriteFileTool,
 )
 from weavecode.core.tools.builtin.update_plan import (
     FilePlanStorage,
+    NoopPlanStorage,
     PlanStorage,
     UpdatePlanTool,
 )
@@ -41,13 +49,6 @@ log = logging.getLogger(__name__)
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
-
-# 读取规则文件全文；文件不存在或读不到时返回空串
-def _read_rules(path: Path) -> str:
-    try:
-        return path.read_text(encoding="utf-8").strip()
-    except OSError:
-        return ""
 
 
 @dataclass
@@ -93,8 +94,14 @@ class AgentRunner:
         session: Session | None = None,
         store: SessionStore | None = None,
         plan_storage: PlanStorage | None = None,
+        working_dir: str | None = None,
     ) -> RunOutcome:
         run_id = run_id or new_run_id()
+        # 工作目录优先级：显式参数 > session 自带 > 进程 cwd
+        if working_dir is None:
+            working_dir = (
+                session.effective_working_dir() if session is not None else str(Path.cwd())
+            )
         # 有会话时读回整段历史并挂到会话的运行目录下，否则从 goal 起一份全新历史
         if session is not None and store is not None:
             run_path = store.runs_dir(session.id) / run_id
@@ -111,9 +118,9 @@ class AgentRunner:
         for h in self._extra_handlers:
             bus.subscribe(h)
 
-        # 记忆背景：全局与项目两级上下文文件，文件不存在或为空时按空串处理
-        global_ctx = _read_rules(Path("~/.weave/context.md").expanduser())
-        project_ctx = _read_rules(Path(".weave/context.md"))
+        # 规则文件：全局 ~/.weave/AGENTS.md + 项目 <working_dir>/.weave/AGENTS.md
+        global_ctx = load_rules_file(Path("~/.weave/AGENTS.md").expanduser())
+        project_ctx = load_rules_file(Path(working_dir) / ".weave" / "AGENTS.md")
 
         # 工作记忆在这里建立：完整历史回放，goal 只在没有历史时作为第一条消息
         context = ExecutionContext(
@@ -123,12 +130,16 @@ class AgentRunner:
             prefill_messages=history,
             global_context=global_ctx,
             project_context=project_ctx,
+            working_dir=working_dir,
         )
 
         # 计划存储：调用方注入时跨 run 复用同一份；否则全量覆盖写进本次会话的任务目录
         if plan_storage is None:
             plan_storage = FilePlanStorage(session_dir / ".tasks")
         session_id = session.id if session is not None else ""
+
+        # 后台子 Agent 登记表：wait_agent 与收工兜底都靠它，整个 run 共用一份
+        runs = BackgroundRuns()
 
         # 事件文件用 async with 打开：无论正常结束、报错还是被中断都会正确关闭
         async with EventWriter(run_path / "events.jsonl") as writer:
@@ -153,6 +164,8 @@ class AgentRunner:
                     provider=provider,
                     bus=bus,
                     session_id=session_id,
+                    working_dir=working_dir,
+                    runs=runs,
                 )
                 compactor = Compactor(bus, session_dir=session_dir)
                 loop = AgentLoop(
@@ -162,6 +175,11 @@ class AgentRunner:
                     session_id=session_id,
                     permission_manager=self._permission_manager,
                     compactor=compactor,
+                    auto_compact=self._config.compaction.auto,
+                    reserve_tokens=self._config.compaction.reserve_tokens,
+                    model=self._config.llm.default_model,
+                    working_dir=working_dir,
+                    runs=runs,
                 )
                 await loop.run(context)
             except asyncio.CancelledError:
@@ -172,6 +190,11 @@ class AgentRunner:
                 log.exception("agent run failed run_id=%s step=%d", run_id, context.step)
                 if not context.is_done():
                     context.mark_failed("llm_error")
+            finally:
+                # run 收尾：取消仍在跑的后台子 Agent，避免它们继续消耗 token
+                # （用户 ESC 中止 / LLM 错误 / 超步数都会走到这里）
+                with suppress(asyncio.CancelledError):
+                    await runs.cancel_all()
 
             # 结束事件在所有情况下都发布，保证事件文件里永远有头有尾
             await bus.publish(
@@ -194,7 +217,20 @@ class AgentRunner:
             reason=context.reason,
         )
 
-    # 构建本次运行的工具注册表：内置文件工具 + 计划工具 + 外部工具服务器的工具
+    # 返回一个 agent 可用的内置工具清单（主 Agent 与子 Agent 共用同一份定义）
+    # 唯一差别由 plan_storage 决定：主 Agent 落盘、子 Agent 用 NoopPlanStorage
+    def _builtin_tools(self, plan_storage: PlanStorage) -> list[BaseTool]:
+        return [
+            ReadFileTool(),
+            BashTool(),
+            WriteFileTool(),
+            ListDirTool(),
+            GlobTool(),
+            GrepTool(),
+            UpdatePlanTool(plan_storage),
+        ]
+
+    # 构建本次运行的工具注册表：内置工具 + 外部工具服务器的工具
     def _build_registry(
         self,
         plan_storage: PlanStorage,
@@ -203,16 +239,17 @@ class AgentRunner:
         provider: LLMProvider | None = None,
         bus: EventBus | None = None,
         session_id: str = "",
+        working_dir: str = "",
+        runs: BackgroundRuns | None = None,
     ) -> ToolRegistry:
         registry = ToolRegistry()
-        for t in [ReadFileTool(), BashTool(), WriteFileTool(), ListDirTool()]:
+        for t in self._builtin_tools(plan_storage):
             registry.register(t)
-        registry.register(UpdatePlanTool(plan_storage))
 
         mcp_tools = self._mcp_manager.get_tools() if self._mcp_manager is not None else []
 
-        # 派生子 Agent 的工具只给主 Agent：子 Agent 的注册表不再登记派生工具
-        if provider is not None and bus is not None and run_id is not None:
+        # 子 Agent 相关工具只给主 Agent：spawn_agent 派生、wait_agent 收后台结果
+        if provider is not None and bus is not None and run_id is not None and runs is not None:
             registry.register(
                 SpawnAgentTool(
                     provider=provider,
@@ -221,9 +258,15 @@ class AgentRunner:
                     permission_manager=self._permission_manager,
                     max_steps=self._config.agent.max_steps,
                     session_id=session_id,
+                    working_dir=working_dir,
                     runs_dir=self._runs_dir,
+                    # 子 Agent 拿到同一份内置工具（计划不落盘）+ MCP 工具，但不含 spawn_agent
+                    child_tools=lambda: self._builtin_tools(NoopPlanStorage()),
+                    mcp_tools=mcp_tools,
+                    runs=runs,
                 )
             )
+            registry.register(WaitAgentTool(runs))
 
         for mcp_tool in mcp_tools:
             registry.register(mcp_tool)
