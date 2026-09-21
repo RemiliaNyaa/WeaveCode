@@ -15,6 +15,7 @@ _DEFAULT_LOG_FILE = "~/.weave/logs/core.log"
 _DEFAULT_LOG_FORMAT = "text"
 _DEFAULT_CONFIG_PATH = "~/.weave/config.json"
 _DEFAULT_MAX_STEPS = 20
+_DEFAULT_STREAM_RETRIES = 5
 _DEFAULT_MODEL = "claude-sonnet-4-6"
 _DEFAULT_TRACE_FILE = "~/.weave/traces/daemon.jsonl"
 
@@ -35,6 +36,8 @@ class AgentConfig:
 class LlmConfig:
     default_model: str = _DEFAULT_MODEL
     router: str = "static"  # "static" | "rule_based" (S4) | "cost_budget" (S6)
+    # 流式调用失败后最多重试几次（首发不算）；退避按 2/4/8/16/32 秒现场计算
+    stream_retries: int = _DEFAULT_STREAM_RETRIES
 
 
 @dataclass
@@ -171,7 +174,7 @@ def _apply_json(config: WeaveConfig, data: dict[str, Any]) -> None:
         llm = data["llm"]
         if not isinstance(llm, dict):
             raise SystemExit("Config error: llm must be a table")
-        unknown_llm: set[str] = set(llm.keys()) - {"default_model", "router"}
+        unknown_llm: set[str] = set(llm.keys()) - {"default_model", "router", "stream_retries"}
         if unknown_llm:
             raise SystemExit(f"Unknown llm keys: {', '.join(sorted(unknown_llm))}")
         if "default_model" in llm:
@@ -184,6 +187,11 @@ def _apply_json(config: WeaveConfig, data: dict[str, Any]) -> None:
             if not isinstance(val, str):
                 raise SystemExit("Config error: llm.router must be a string")
             config.llm.router = val
+        if "stream_retries" in llm:
+            val = llm["stream_retries"]
+            if not isinstance(val, int) or val < 0:
+                raise SystemExit("Config error: llm.stream_retries must be a non-negative integer")
+            config.llm.stream_retries = val
 
     if "trace" in data:
         trace = data["trace"]
@@ -352,6 +360,22 @@ def _apply_env(config: WeaveConfig) -> None:
     default_model = os.environ.get("WEAVE_LLM_DEFAULT_MODEL")
     if default_model is not None:
         config.llm.default_model = default_model
+
+    stream_retries_str = os.environ.get("WEAVE_LLM_STREAM_RETRIES")
+    if stream_retries_str is not None:
+        try:
+            val = int(stream_retries_str)
+            if val < 0:
+                raise SystemExit(
+                    "Config error: WEAVE_LLM_STREAM_RETRIES must be a non-negative integer,"
+                    f" got: {stream_retries_str!r}"
+                )
+            config.llm.stream_retries = val
+        except ValueError:
+            raise SystemExit(
+                "Config error: WEAVE_LLM_STREAM_RETRIES must be an integer,"
+                f" got: {stream_retries_str!r}"
+            )
 
     trace_enabled = os.environ.get("WEAVE_TRACE_ENABLED")
     if trace_enabled is not None:

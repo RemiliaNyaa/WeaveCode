@@ -203,3 +203,145 @@ async def test_no_tokens_when_response_is_empty() -> None:
     tokens = [e for e in events if e.type == "llm.token"]  # type: ignore[attr-defined]
     assert tokens == []
     assert result.text == ""
+
+
+# ---------------------------- 流式重试（改动三十二） ----------------------------
+
+
+class _RecordingSleep:
+    """假的 asyncio.sleep：记录退避时长、不真的等。"""
+
+    def __init__(self) -> None:
+        self.delays: list[float] = []
+
+    async def __call__(self, delay: float) -> None:
+        self.delays.append(delay)
+
+
+class FailingStream:
+    """先吐几个 token、再抛传输异常——模拟「流到一半断了」。"""
+
+    def __init__(self, texts: list[str], exc: Exception) -> None:
+        self._texts = texts
+        self._exc = exc
+
+    async def __aenter__(self) -> FailingStream:
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        pass
+
+    @property
+    def text_stream(self):  # type: ignore[return]
+        async def _gen():
+            for t in self._texts:
+                yield t
+            raise self._exc
+
+        return _gen()
+
+    async def get_final_message(self) -> MagicMock:
+        raise AssertionError("流已经断了，不该走到 get_final_message")
+
+
+# 造一个「前几次抛指定异常、之后成功」的假 provider
+def _flaky_provider(
+    failures: list[Exception], texts: list[str], max_retries: int = 5
+) -> tuple[AnthropicProvider, MagicMock]:
+    final = _make_final("end_turn", None, 100, 50, 0)
+    client = MagicMock()
+    client.messages.stream.side_effect = [*failures, FakeStream(texts, final)]
+    return AnthropicProvider(model="test-model", client=client, max_retries=max_retries), client
+
+
+# 功能：流式调用遇到传输类异常时会重试，重试成功后正常返回结果
+# 设计：第一次抛 httpx.ReadError、第二次成功；断言拿到结果且 stream 被调了 2 次
+@pytest.mark.asyncio
+async def test_stream_retry_recovers(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(asyncio, "sleep", _RecordingSleep())
+    provider, client = _flaky_provider([httpx.ReadError("dropped")], ["hello"])
+
+    resp, _ = await _chat(provider)
+
+    assert resp.text == "hello"
+    assert client.messages.stream.call_count == 2
+
+
+# 功能：非传输类异常不重试，直接抛出去
+# 设计：抛 ValueError 并断言 stream 只被调一次——参数错/鉴权失败这类重试也没用，不该浪费尝试
+@pytest.mark.asyncio
+async def test_non_transport_error_is_not_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(asyncio, "sleep", _RecordingSleep())
+    provider, client = _flaky_provider([ValueError("bad request")], ["hello"])
+
+    with pytest.raises(ValueError):
+        await _chat(provider)
+
+    assert client.messages.stream.call_count == 1
+
+
+# 功能：重试时丢弃上一次已收到的 partial token，不把两次输出拼起来
+# 设计：第一次吐 "AAA" 后断、第二次吐 "BBB"；断言最终 text 是 "BBB" 而不是 "AAABBB"——
+#       这是 text_parts 每次尝试开头被重置的证据，否则输出会变成重复的乱码
+@pytest.mark.asyncio
+async def test_partial_output_discarded_on_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(asyncio, "sleep", _RecordingSleep())
+    final = _make_final("end_turn", None, 100, 50, 0)
+    client = MagicMock()
+    client.messages.stream.side_effect = [
+        FailingStream(["AAA"], httpx.ReadError("dropped")),
+        FakeStream(["BBB"], final),
+    ]
+    provider = AnthropicProvider(model="test-model", client=client)
+
+    resp, _ = await _chat(provider)
+
+    assert resp.text == "BBB"
+
+
+# 功能：只在第 1 次尝试发 llm.token 事件，重试不再重复发
+# 设计：第一次吐 "AAA" 后断、第二次吐 "BBB"；断言 token 事件只有 "AAA"——
+#       否则 TUI 上同一段话会被渲染两遍
+@pytest.mark.asyncio
+async def test_token_events_only_from_first_attempt(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(asyncio, "sleep", _RecordingSleep())
+    final = _make_final("end_turn", None, 100, 50, 0)
+    client = MagicMock()
+    client.messages.stream.side_effect = [
+        FailingStream(["AAA"], httpx.ReadError("dropped")),
+        FakeStream(["BBB"], final),
+    ]
+    provider = AnthropicProvider(model="test-model", client=client)
+
+    _, events = await _chat(provider)
+
+    tokens = [e.token for e in events if e.__class__.__name__ == "LlmTokenEvent"]
+    assert tokens == ["AAA"]
+
+
+# 功能：用完重试次数后抛出异常，总尝试次数 = 1 次首发 + max_retries 次重试
+# 设计：max_retries=5、连续 6 次失败；断言 stream 恰好被调 6 次且异常抛出——
+#       锁住「重试次数」的口径（是重试次数，不是尝试次数）
+@pytest.mark.asyncio
+async def test_gives_up_after_max_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(asyncio, "sleep", _RecordingSleep())
+    provider, client = _flaky_provider([httpx.ReadError("x")] * 6, ["hello"], max_retries=5)
+
+    with pytest.raises(httpx.ReadError):
+        await _chat(provider)
+
+    assert client.messages.stream.call_count == 6
+
+
+# 功能：退避时长现场计算（2/4/8/16/32 秒），不写死元组
+# 设计：记录每次 sleep 的时长并断言精确序列——这条同时保证「重试次数改了退避自动跟着变」
+@pytest.mark.asyncio
+async def test_backoff_is_computed_exponentially(monkeypatch: pytest.MonkeyPatch) -> None:
+    sleep = _RecordingSleep()
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    provider, _ = _flaky_provider([httpx.ReadError("x")] * 6, ["hello"], max_retries=5)
+
+    with pytest.raises(httpx.ReadError):
+        await _chat(provider)
+
+    assert sleep.delays == [2.0, 4.0, 8.0, 16.0, 32.0]

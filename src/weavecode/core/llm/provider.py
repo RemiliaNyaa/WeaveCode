@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 import os
 from datetime import UTC, datetime
 from typing import Any
 
 import anthropic
+import httpx
 
 from weavecode.core.bus.events import LlmModelSelectedEvent, LlmTokenEvent, LlmUsageEvent
 from weavecode.core.events.bus import EventBus
@@ -13,6 +16,15 @@ from weavecode.core.llm.types import LlmResponse, ToolCallBlock, UsageStats
 
 # 单次请求的输出上限默认值；实际取它与模型输出上限的较小者
 _DEFAULT_MAX_TOKENS = 8_192
+
+# 流式调用失败后最多重试几次（首发不算，所以最多 _STREAM_MAX_RETRIES + 1 次尝试）
+_STREAM_MAX_RETRIES = 5
+# 退避起始秒数：第 n 次重试等待 _STREAM_RETRY_BASE_S * 2^(n-1)，即 2 / 4 / 8 / 16 / 32 秒
+# （现场计算，不写死元组 —— 重试次数改了退避自动跟着变）
+_STREAM_RETRY_BASE_S = 2.0
+
+log = logging.getLogger(__name__)
+
 
 _SYSTEM_PROMPT = (
     "You are Weave, an AI assistant operating in a terminal environment. "
@@ -48,13 +60,18 @@ _SYSTEM_PROMPT = (
     "completed, the next step in_progress, at most one in_progress at a time.\n"
     "\n"
     "## Sub-agents\n"
-    "- spawn_agent blocks: it waits for the sub-agent to finish and returns the "
-    "result directly.\n"
-    "- To run multiple sub-agents in parallel, issue MULTIPLE spawn_agent tool calls "
-    "in a single tool-calling step (one call per sub-task). Do NOT wait for one "
-    "sub-agent to finish before issuing the next call.\n"
-    "- Only spawn a sub-agent when the work is large, self-contained and "
-    "independent; small steps are faster done directly.\n"
+    "- spawn_agent blocks by default: it waits for the sub-agent to finish and returns "
+    "the result directly. Set background=true to run the sub-agent in the background "
+    "instead - the call returns a run_id immediately.\n"
+    "- To run multiple sub-agents in parallel, issue MULTIPLE spawn_agent tool calls in "
+    "a single tool-calling step (one call per sub-task). Do NOT wait for one sub-agent "
+    "to finish before issuing the next call.\n"
+    "- Use background=true only when you have other work to do while the sub-agents "
+    "run. Background execution must be requested on EVERY spawn_agent call in that "
+    "step: if even one of them is blocking, they all block.\n"
+    "- Collect background sub-agents with wait_agent (omit run_ids to wait for all of "
+    "them). Every background sub-agent you started must be collected before you finish "
+    "your turn.\n"
     "\n"
     "## Finishing\n"
     "- Keep working until the goal is fully achieved. When done, respond with a "
@@ -69,7 +86,9 @@ def _now() -> str:
 
 class AnthropicProvider:
     # 初始化 Anthropic 客户端；client 可在测试时注入以跳过 API key 检查
-    def __init__(self, model: str, client: Any = None) -> None:
+    def __init__(
+        self, model: str, client: Any = None, max_retries: int = _STREAM_MAX_RETRIES
+    ) -> None:
         if client is None:
             api_key = os.environ.get("ANTHROPIC_API_KEY")
             if not api_key:
@@ -78,8 +97,9 @@ class AnthropicProvider:
         else:
             self._client = client
         self._model = model
+        self._max_retries = max_retries
 
-    # 流式调用 Anthropic API，逐 token 发布事件并返回 LlmResponse
+    # 流式调用 Anthropic API，逐 token 发布事件并返回 LlmResponse；网络中断时自动重试
     async def chat(
         self,
         messages: list[dict[str, object]],
@@ -94,7 +114,6 @@ class AnthropicProvider:
             LlmModelSelectedEvent(run_id=run_id, model=self._model, strategy="static", ts=_now())
         )
 
-        # system 文本打上缓存断点：一次 run 里前缀不变，第二步起就能命中缓存
         system_blocks: list[dict[str, object]] = [
             {
                 "type": "text",
@@ -103,7 +122,6 @@ class AnthropicProvider:
             },
         ]
 
-        # 工具 schema 随请求注入；断点加在最后一项，整个工具列表作为一个缓存前缀
         tools: list[dict[str, object]] = list(tool_schemas)
         if tools:
             last = dict(tools[-1])
@@ -120,16 +138,39 @@ class AnthropicProvider:
             kwargs["tools"] = tools
 
         text_parts: list[str] = []
-        async with self._client.messages.stream(**kwargs) as stream:
-            async for text in stream.text_stream:
-                await bus.publish(LlmTokenEvent(run_id=run_id, token=text, ts=_now()))
-                text_parts.append(text)
-            final_message = await stream.get_final_message()
+        final_message: Any = None
+
+        # 最多重试 self._max_retries 次（首发之外）；退避现场计算，不写死元组
+        for attempt in range(1, self._max_retries + 2):
+            text_parts = []
+            try:
+                async with self._client.messages.stream(**kwargs) as stream:
+                    async for text in stream.text_stream:
+                        # Only publish token events on the first attempt to avoid TUI duplicates
+                        if attempt == 1:
+                            await bus.publish(LlmTokenEvent(run_id=run_id, token=text, ts=_now()))
+                        text_parts.append(text)
+                    final_message = await stream.get_final_message()
+                break  # success
+            except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ConnectError) as exc:
+                if attempt > self._max_retries:
+                    log.error(
+                        "stream failed after %d attempts run_id=%s step=%d: %s",
+                        attempt, run_id, step, exc,
+                    )
+                    raise
+                delay = _STREAM_RETRY_BASE_S * (2 ** (attempt - 1))
+                log.warning(
+                    "stream dropped (attempt %d/%d) run_id=%s step=%d: %s — retrying in %.0fs",
+                    attempt, self._max_retries + 1, run_id, step, exc, delay,
+                )
+                await asyncio.sleep(delay)
+
+        assert final_message is not None
 
         usage = final_message.usage
         cache_read: int = getattr(usage, "cache_read_input_tokens", 0) or 0
         cache_create: int = getattr(usage, "cache_creation_input_tokens", 0) or 0
-        # 上下文水位：本轮输入占模型窗口的比例，随用量事件下发给客户端显示
         context_pct = usage.input_tokens / model_table.context_window(self._model)
 
         await bus.publish(
@@ -153,9 +194,7 @@ class AnthropicProvider:
                 )
             elif block.type == "thinking":
                 # thinking blocks must be passed back verbatim in subsequent requests
-                thinking_blocks.append(
-                    {"type": "thinking", "thinking": block.thinking, "signature": block.signature}
-                )
+                thinking_blocks.append({"type": "thinking", "thinking": block.thinking, "signature": block.signature})
 
         return LlmResponse(
             stop_reason=final_message.stop_reason or "end_turn",

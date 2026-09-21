@@ -48,23 +48,72 @@ def test_missing_env_file_silent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     assert cfg.port == 7437
 
 
+# 功能：验证 .env 中设置的 WEAVE_CONFIG 能正确影响 JSON 配置文件的加载路径
+# 设计：.env 指向自定义 JSON 文件，JSON 中写入不同端口，确认 .env 在 JSON 加载前被读取（优先级链的正确顺序）
+def test_dotenv_before_json_weave_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    json_path = tmp_path / "custom.json"
+    json_path.write_text('{"core": {"port": 5555}}', encoding="utf-8")
+
+    env_file = tmp_path / ".env"
+    _write_env(env_file, f"WEAVE_CONFIG={json_path}\n")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("WEAVE_CONFIG", raising=False)
+    monkeypatch.delenv("WEAVE_PORT", raising=False)
+
+    cfg = get_config()
+
+    assert cfg.port == 5555
+
+
 # 功能：验证同一变量经过完整四级优先链后，最终值为最高优先级来源（系统环境变量）
-# 设计：同时设置默认值(7437)/配置文件(6000)/.env(7000)/系统环境变量(8000)，确认最终值为 8000，是优先级链的综合正确性验证
+# 设计：同时设置默认值(7437)/JSON(6000)/.env(7000)/系统环境变量(8000)，确认最终值为 8000，是优先级链的综合正确性验证
 def test_priority_chain_full(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # 默认值：7437
-    # 配置文件：6000
+    # JSON：6000
     # .env：7000
     # 系统环境变量：8000（最高）
-    cfg_path = tmp_path / "weave.toml"
-    cfg_path.write_text("[core]\nport = 6000\n", encoding="utf-8")
+    json_path = tmp_path / "weave.json"
+    json_path.write_text('{"core": {"port": 6000}}', encoding="utf-8")
 
     env_file = tmp_path / ".env"
     _write_env(env_file, "WEAVE_PORT=7000\n")
 
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("WEAVE_CONFIG", str(cfg_path))
+    monkeypatch.setenv("WEAVE_CONFIG", str(json_path))
     monkeypatch.setenv("WEAVE_PORT", "8000")
 
     cfg = get_config()
 
     assert cfg.port == 8000
+
+
+# 功能：JSON 配置里的 llm.stream_retries 能被读到（流式重试次数可配）
+# 设计：写一个非默认值（3）并断言生效——用默认值 5 无法区分「读到了」还是「用了默认」
+def test_llm_stream_retries_from_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    json_path = tmp_path / "weave.json"
+    json_path.write_text('{"llm": {"stream_retries": 3}}', encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("WEAVE_CONFIG", str(json_path))
+    monkeypatch.delenv("WEAVE_LLM_STREAM_RETRIES", raising=False)
+
+    cfg = get_config()
+
+    assert cfg.llm.stream_retries == 3
+
+
+# 功能：环境变量 WEAVE_LLM_STREAM_RETRIES 的优先级高于 JSON 配置
+# 设计：JSON 写 3、环境变量写 7，断言最终为 7——锁住「环境变量在四级优先链顶层」
+def test_llm_stream_retries_env_overrides_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    json_path = tmp_path / "weave.json"
+    json_path.write_text('{"llm": {"stream_retries": 3}}', encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("WEAVE_CONFIG", str(json_path))
+    monkeypatch.setenv("WEAVE_LLM_STREAM_RETRIES", "7")
+
+    cfg = get_config()
+
+    assert cfg.llm.stream_retries == 7
