@@ -102,16 +102,15 @@ class AgentRunner:
             working_dir = (
                 session.effective_working_dir() if session is not None else str(Path.cwd())
             )
-        # 有会话时读回整段历史并挂到会话的运行目录下，否则从 goal 起一份全新历史
-        if session is not None and store is not None:
-            run_path = store.runs_dir(session.id) / run_id
-            history = store.read_messages(session.id)
-            session_dir = store.session_dir(session.id)
-        else:
-            run_path = self._runs_dir / run_id
-            history = [{"role": "user", "content": goal}]
-            session_dir = run_path
+        # 会话与消息已入库：运行目录只剩事件文件与计划文件两个用途
+        run_path = self._runs_dir / run_id
         run_path.mkdir(parents=True, exist_ok=True)
+
+        # 恢复历史改成就地等待落库的异步读取；无会话时从 goal 起一份全新历史
+        if session is not None and store is not None:
+            history = await store.read_messages(session.id)
+        else:
+            history = [{"role": "user", "content": goal}]
 
         # 建立事件总线，订阅调用方传进来的监听者
         bus = self._bus if self._bus is not None else EventBus()
@@ -133,9 +132,12 @@ class AgentRunner:
             working_dir=working_dir,
         )
 
-        # 计划存储：调用方注入时跨 run 复用同一份；否则全量覆盖写进本次会话的任务目录
+        # 计划存储：调用方注入时跨 run 复用同一份；否则全量覆盖写进会话的任务目录
         if plan_storage is None:
-            plan_storage = FilePlanStorage(session_dir / ".tasks")
+            tasks_dir = run_path / ".tasks"
+            if session is not None:
+                tasks_dir = Path("~/.weave/sessions").expanduser() / session.id / ".tasks"
+            plan_storage = FilePlanStorage(tasks_dir)
         session_id = session.id if session is not None else ""
 
         # 后台子 Agent 登记表：wait_agent 与收工兜底都靠它，整个 run 共用一份
@@ -167,7 +169,7 @@ class AgentRunner:
                     working_dir=working_dir,
                     runs=runs,
                 )
-                compactor = Compactor(bus, session_dir=session_dir)
+                compactor = Compactor(bus, session_id=session_id)
                 loop = AgentLoop(
                     provider,
                     registry,

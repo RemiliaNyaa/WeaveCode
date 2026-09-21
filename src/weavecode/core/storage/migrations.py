@@ -9,7 +9,7 @@ from weavecode.core.storage.database import Database
 # 一条迁移：版本号（从 1 递增）+ 名字 + 建表/改表的同步函数
 Migration = tuple[int, str, Callable[[sqlite3.Connection], None]]
 
-# 迁移清单：编号从 1 起递增，新的迁移实现追加在本文件末尾
+# 迁移清单：**只能往后追加**，已发布的迁移不许改（否则老库跑不到新 schema）
 MIGRATIONS: list[Migration] = []
 
 

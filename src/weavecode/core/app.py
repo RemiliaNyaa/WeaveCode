@@ -23,6 +23,9 @@ from weavecode.core.bus.commands import (
     PermissionRespondCommand,
     PermissionRespondResult,
     PongResult,
+    RulesFileView,
+    RulesShowCommand,
+    RulesShowResult,
     SessionCloseCommand,
     SessionCloseResult,
     SessionCompactCommand,
@@ -44,6 +47,7 @@ from weavecode.core.permissions.manager import PermissionManager
 from weavecode.core.runner import AgentRunner
 from weavecode.core.runs import events_file, new_run_id
 from weavecode.core.session import SessionManager, SessionStore
+from weavecode.core.storage import Database, apply_migrations
 from weavecode.core.trace.record import TraceRecord
 from weavecode.core.trace.writer import TraceWriter
 from weavecode.core.transport.ipc_broadcaster import IpcEventBroadcaster
@@ -67,6 +71,7 @@ class CoreApp:
         self._sessions: SessionManager | None = None
         self._permission_manager: PermissionManager | None = None
         self._mcp_manager: McpServerManager | None = None
+        self._db: Database | None = None
 
     # 处理 core.ping 请求，返回服务版本、运行时长和接收时间
     async def _ping_handler(self, params: dict[str, Any]) -> PongResult:
@@ -97,7 +102,9 @@ class CoreApp:
     async def _agent_run_handler(self, params: dict[str, Any]) -> AgentRunResult:
         assert self._sessions is not None
         cmd = AgentRunCommand.model_validate(params)
-        session = await self._sessions.create(mode="one_shot", title=cmd.goal[:40])
+        session = await self._sessions.create(
+            mode="one_shot", title=cmd.goal[:40], working_dir=cmd.cwd
+        )
         run_id = new_run_id()
         run_task = asyncio.create_task(
             self._sessions.send_message(session.id, cmd.goal, run_id=run_id)
@@ -110,7 +117,9 @@ class CoreApp:
     async def _session_create_handler(self, params: dict[str, Any]) -> SessionCreateResult:
         assert self._sessions is not None
         cmd = SessionCreateCommand.model_validate(params)
-        session = await self._sessions.create(mode=cmd.mode, title=cmd.title)
+        session = await self._sessions.create(
+            mode=cmd.mode, title=cmd.title, working_dir=cmd.cwd
+        )
         return SessionCreateResult(session_id=session.id, status=session.status)
 
     # 向 session 发送一条用户消息并同步等待对应 run 完成
@@ -146,6 +155,42 @@ class CoreApp:
         cmd = SessionCompactCommand.model_validate(params)
         result = await self._sessions.compact(cmd.session_id, cmd.focus)
         return result  # type: ignore[no-any-return]
+
+    # 返回全局与项目 AGENTS.md 的预览（供 TUI 的 /rules 命令显示）
+    async def _rules_show_handler(self, params: dict[str, Any]) -> RulesShowResult:
+        from weavecode.core.memory.loader import (
+            MAX_RULE_LINES,
+            PREVIEW_BYTES,
+            PREVIEW_LINES,
+            global_rules_path,
+            preview_rules,
+            project_rules_path,
+        )
+
+        cmd = RulesShowCommand.model_validate(params)
+        cwd = cmd.cwd or str(Path.cwd())
+        previews = [
+            preview_rules(global_rules_path(), "global"),
+            preview_rules(project_rules_path(cwd), "project"),
+        ]
+        return RulesShowResult(
+            files=[
+                RulesFileView(
+                    scope=p.scope,
+                    path=p.path,
+                    exists=p.exists,
+                    total_lines=p.total_lines,
+                    total_bytes=p.total_bytes,
+                    shown_lines=p.shown_lines,
+                    content=p.content,
+                    truncated=p.truncated,
+                )
+                for p in previews
+            ],
+            inject_line_limit=MAX_RULE_LINES,
+            preview_line_limit=PREVIEW_LINES,
+            preview_byte_limit=PREVIEW_BYTES,
+        )
 
     # 关闭 session 并返回 closed 状态
     async def _session_close_handler(self, params: dict[str, Any]) -> SessionCloseResult:
@@ -229,7 +274,12 @@ class CoreApp:
             self._config.permission.timeout_s,
         )
 
-        store = SessionStore()
+        # 打开 SQLite 并跑迁移；旧的文件式存储已作废（见《数据存储迁移到 SQLite：执行计划》）
+        self._db = Database()
+        ran = await apply_migrations(self._db)
+        if ran:
+            logger.info("db: applied %d migration(s): %s", len(ran), ran)
+        store = SessionStore(self._db)
 
         assert self._config is not None
         compact_provider = AnthropicProvider(self._config.llm.default_model)
@@ -270,6 +320,7 @@ class CoreApp:
         server.register("session.close", self._session_close_handler)
         server.register("permission.respond", self._permission_respond_handler)
         server.register("session.compact", self._session_compact_handler)
+        server.register("rules.show", self._rules_show_handler)
 
         addr = await server.start()
         logger.info("weave-core %s listening addr=%s", weavecode.__version__, addr)

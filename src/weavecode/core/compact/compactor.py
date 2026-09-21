@@ -3,12 +3,12 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from weavecode.core.bus.events import ContextCompactedEvent
 from weavecode.core.compact.tokens import estimate_messages
 from weavecode.core.events.bus import EventBus
+from weavecode.core.storage.database import Database
 
 if TYPE_CHECKING:
     from weavecode.core.context import ExecutionContext
@@ -196,21 +196,21 @@ def build_prompt(material: str, prior_summary: str | None, focus: str = "") -> s
 
 
 class Compactor:
-    # 初始化压缩器，绑定事件总线、会话目录、session ID 与保留窗口
+    # 初始化压缩器，绑定事件总线、数据库连接、session ID 与保留窗口
     def __init__(
         self,
         bus: EventBus,
-        session_dir: str | Path,
+        db: Database | None,
         session_id: str,
         *,
         keep_tokens: int = 8_000,
     ) -> None:
         self._bus = bus
-        self._session_dir = Path(session_dir)
+        self._db = db
         self._session_id = session_id
         self._keep_tokens = keep_tokens
 
-    # 压缩 ExecutionContext.messages，就地替换为 [checkpoint, 确认] 并把摘要落盘
+    # 压缩 ExecutionContext.messages，就地替换为 [checkpoint, 确认] 并广播压缩事件
     async def compact(
         self,
         context: ExecutionContext,
@@ -222,7 +222,6 @@ class Compactor:
             return None
 
         context.messages = result.as_messages()
-        self._write_summary(result.summary_text)
         await self._bus.publish(
             ContextCompactedEvent(
                 session_id=self._session_id,
@@ -294,17 +293,6 @@ class Compactor:
             response.usage.output_tokens if response.usage else len(summary_text) // 4
         )
         return summary_text, summary_tokens
-
-    # 把摘要写进会话目录的 summary_<时间戳>.md：压缩有损，留痕便于回查
-    def _write_summary(self, text: str) -> None:
-        if not self._session_id:
-            return
-        try:
-            self._session_dir.mkdir(parents=True, exist_ok=True)
-            stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
-            (self._session_dir / f"summary_{stamp}.md").write_text(text, encoding="utf-8")
-        except OSError:
-            logger.exception("compactor: failed to write summary file")
 
 
 # 将消息列表序列化为可供 LLM 阅读的纯文本

@@ -51,6 +51,13 @@ class Database:
     async def transaction(self, action: Callable[[sqlite3.Connection], T]) -> T:
         return await self.run(lambda conn: _in_transaction(conn, action))
 
+    # 关闭连接（daemon 退出时调）
+    async def close(self) -> None:
+        async with self._lock:
+            if self._conn is not None:
+                await asyncio.to_thread(self._conn.close)
+                self._conn = None
+
     # 同步核心：确保连接已开 → 执行 action（锁已由 run 持有）
     def _execute(self, action: Callable[[sqlite3.Connection], T]) -> T:
         return action(self._ensure_conn())
@@ -62,6 +69,7 @@ class Database:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         # isolation_level=None → 关掉 sqlite3 的隐式事务，由我们显式 BEGIN/COMMIT
         conn = sqlite3.connect(self._path, check_same_thread=False, isolation_level=None)
+        conn.row_factory = sqlite3.Row
         for pragma in _PRAGMAS:
             conn.execute(pragma)
         log.info("db: opened %s", self._path)
