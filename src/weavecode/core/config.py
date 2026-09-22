@@ -15,6 +15,7 @@ _DEFAULT_LOG_FILE = "~/.weave/logs/core.log"
 _DEFAULT_LOG_FORMAT = "text"
 _DEFAULT_CONFIG_PATH = "~/.weave/config.json"
 _DEFAULT_MAX_STEPS = 20
+_DEFAULT_REPEAT_LIMIT = 3
 _DEFAULT_STREAM_RETRIES = 5
 _DEFAULT_MODEL = "claude-sonnet-4-6"
 _DEFAULT_TRACE_FILE = "~/.weave/traces/daemon.jsonl"
@@ -30,6 +31,8 @@ class LoggingConfig:
 @dataclass
 class AgentConfig:
     max_steps: int = _DEFAULT_MAX_STEPS
+    # 连续多少步发出完全相同的工具调用就判定为重复死循环（见 loop.py 的重复调用闸门）
+    repeat_limit: int = _DEFAULT_REPEAT_LIMIT
 
 
 @dataclass
@@ -161,7 +164,7 @@ def _apply_json(config: WeaveConfig, data: dict[str, Any]) -> None:
         agent = data["agent"]
         if not isinstance(agent, dict):
             raise SystemExit("Config error: agent must be a table")
-        unknown_agent: set[str] = set(agent.keys()) - {"max_steps"}
+        unknown_agent: set[str] = set(agent.keys()) - {"max_steps", "repeat_limit"}
         if unknown_agent:
             raise SystemExit(f"Unknown agent keys: {', '.join(sorted(unknown_agent))}")
         if "max_steps" in agent:
@@ -169,6 +172,11 @@ def _apply_json(config: WeaveConfig, data: dict[str, Any]) -> None:
             if not isinstance(val, int) or val <= 0:
                 raise SystemExit("Config error: agent.max_steps must be a positive integer")
             config.agent.max_steps = val
+        if "repeat_limit" in agent:
+            val = agent["repeat_limit"]
+            if not isinstance(val, int) or val <= 0:
+                raise SystemExit("Config error: agent.repeat_limit must be a positive integer")
+            config.agent.repeat_limit = val
 
     if "llm" in data:
         llm = data["llm"]
@@ -355,6 +363,21 @@ def _apply_env(config: WeaveConfig) -> None:
         except ValueError:
             raise SystemExit(
                 f"Config error: WEAVE_MAX_STEPS must be an integer, got: {max_steps_str!r}"
+            )
+
+    repeat_limit_str = os.environ.get("WEAVE_REPEAT_LIMIT")
+    if repeat_limit_str is not None:
+        try:
+            val = int(repeat_limit_str)
+            if val <= 0:
+                raise SystemExit(
+                    "Config error: WEAVE_REPEAT_LIMIT must be a positive integer,"
+                    f" got: {repeat_limit_str!r}"
+                )
+            config.agent.repeat_limit = val
+        except ValueError:
+            raise SystemExit(
+                f"Config error: WEAVE_REPEAT_LIMIT must be an integer, got: {repeat_limit_str!r}"
             )
 
     default_model = os.environ.get("WEAVE_LLM_DEFAULT_MODEL")

@@ -182,6 +182,7 @@ class AgentRunner:
                     model=self._config.llm.default_model,
                     working_dir=working_dir,
                     runs=runs,
+                    repeat_limit=self._config.agent.repeat_limit,
                 )
                 await loop.run(context)
             except asyncio.CancelledError:

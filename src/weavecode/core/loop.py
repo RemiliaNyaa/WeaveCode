@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
@@ -36,6 +37,17 @@ SPAWN_AGENT_TOOL_NAME = "spawn_agent"
 _MAX_COLLECT_NUDGES = 1
 _MAX_AUTO_COLLECTS = 1
 
+# 重复调用闸门：连续命中几次拦截就强制终止 run（第 1、2 次只回填错误，第 3 次终止）
+_REPEAT_MAX_HITS = 3
+
+# 被重复闸门拦下时回填给模型的文案（英文，与工具结果的其它错误文案一致）
+_REPEAT_BLOCKED_TEXT = (
+    "Blocked: this exact tool call (same tool, same arguments) has already been "
+    "repeated {n} times in a row. Repeating it will not produce a different result. "
+    "Change your approach: use different arguments, use another tool, or explain "
+    "why you are stuck."
+)
+
 # 系统提示词基础段由 provider 持有，循环直接导入复用，避免同一份文本出现两处拷贝
 
 # 终止条件只有三条：
@@ -61,6 +73,20 @@ def _normalize_spawn_modes(tool_calls: list[ToolCallBlock]) -> None:
         return  # 全部显式 background=true → 保持非阻塞
     for tc in spawns:
         tc.input["background"] = False
+
+
+# 单个工具调用的签名：工具名 + 规范化参数（键序不影响判定）
+def _call_signature(tool_call: ToolCallBlock) -> str:
+    try:
+        payload = json.dumps(tool_call.input, sort_keys=True, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        payload = str(sorted(tool_call.input.items()))
+    return f"{tool_call.name}({payload})"
+
+
+# 一步的调用签名：该步所有工具调用的签名排序后拼接（同一批调用的顺序不影响判定）
+def _step_signature(tool_calls: list[ToolCallBlock]) -> str:
+    return "\n".join(sorted(_call_signature(tc) for tc in tool_calls))
 
 
 # 第一级兜底文案：提醒模型还有后台子 Agent 在跑，不能结束本轮
@@ -105,6 +131,7 @@ class AgentLoop:
         model: str = "",
         working_dir: str = "",
         runs: BackgroundRuns | None = None,
+        repeat_limit: int = 3,
     ) -> None:
         self._provider = provider
         self._registry = registry
@@ -123,6 +150,11 @@ class AgentLoop:
         self._runs = runs
         self._collect_nudges = 0
         self._auto_collects = 0
+        # 重复调用闸门状态：上一步的签名 + 连续相同次数 + 本次连续重复期间被拦次数
+        self._repeat_limit = repeat_limit
+        self._last_step_sig = ""
+        self._repeat_streak = 0
+        self._repeat_hits = 0
         self._projector = RequestProjector()
 
 
@@ -179,25 +211,38 @@ class AgentLoop:
 
             # act：逐个执行工具调用，失败结果同样回填给模型
             if response.stop_reason == "tool_use":
-                # 会话标识随权限审批一起下发（审批按会话记缓存）；没接入审批链路时保持最简调用
-                invoke_extra: dict[str, Any] = {}
-                if self._permission_manager is not None:
-                    invoke_extra = {
-                        "permission_manager": self._permission_manager,
-                        "session_id": self._session_id,
-                        "working_dir": self._working_dir,
-                    }
-                # 并发执行本轮所有工具调用；gather 按传入顺序返回，结果与调用一一配对
-                results = await asyncio.gather(
-                    *[
-                        invoke_tool(
-                            self._registry, tc, self._bus, context.run_id, **invoke_extra
+                # 重复调用闸门：连续 N 步发出完全相同的调用 → 拦下（第 3 次拦截则终止 run）
+                blocked, terminate = self._repeat_gate(response.tool_calls)
+                if terminate:
+                    text = _REPEAT_BLOCKED_TEXT.format(n=self._repeat_streak)
+                    # 仍然补齐 tool_result：保证 assistant(tool_use) 有配对，历史回放不残缺
+                    for tc in response.tool_calls:
+                        context.add_tool_result(tc.id, text, is_error=True)
+                    context.mark_failed("repeat_loop")
+                else:
+                    # 会话标识随权限审批一起下发（审批按会话记缓存）；没接入审批链路时保持最简调用
+                    invoke_extra: dict[str, Any] = {}
+                    if self._permission_manager is not None:
+                        invoke_extra = {
+                            "permission_manager": self._permission_manager,
+                            "session_id": self._session_id,
+                            "working_dir": self._working_dir,
+                        }
+                    # 并发执行本轮所有工具调用；gather 按传入顺序返回，结果与调用一一配对
+                    results = await asyncio.gather(
+                        *[
+                            invoke_tool(
+                                self._registry, tc, self._bus, context.run_id, **invoke_extra
+                            )
+                            if tc.id not in blocked
+                            else self._blocked_tool_result(context.run_id, tc)
+                            for tc in response.tool_calls
+                        ]
+                    )
+                    for tc, result in zip(response.tool_calls, results):
+                        context.add_tool_result(
+                            tc.id, result.content, is_error=result.is_error
                         )
-                        for tc in response.tool_calls
-                    ]
-                )
-                for tc, result in zip(response.tool_calls, results):
-                    context.add_tool_result(tc.id, result.content, is_error=result.is_error)
             elif response.stop_reason == "max_tokens" and response.tool_calls:
                 # 输出被 token 上限截断，工具调用只有半截：补一条错误结果保持配对完整
                 for tc in response.tool_calls:
@@ -236,6 +281,52 @@ class AgentLoop:
             await self._bus.publish(
                 StepFinishedEvent(run_id=context.run_id, step=context.step, ts=_now())
             )
+
+    # 重复调用闸门：连续 N 步发出完全相同的工具调用 → 判定为原地打转
+    #
+    # 状态只有一对「上一步签名 + 连续次数」：相同 +1、不同就替换并清零（模型换路了就重新给机会）。
+    # 返回 (被拦下的 tool_use_id 集合, 是否强制终止 run)。
+    def _repeat_gate(self, tool_calls: list[ToolCallBlock]) -> tuple[set[str], bool]:
+        sig = _step_signature(tool_calls)
+        if sig == self._last_step_sig:
+            self._repeat_streak += 1
+        else:
+            self._last_step_sig = sig
+            self._repeat_streak = 1
+            self._repeat_hits = 0
+
+        if self._repeat_streak < self._repeat_limit:
+            return set(), False
+
+        self._repeat_hits += 1
+        if self._repeat_hits >= _REPEAT_MAX_HITS:
+            return set(), True
+        return {tc.id for tc in tool_calls}, False
+
+    # 被重复闸门拦下的调用：不执行，直接回填错误结果；并补发事件让 TUI 当普通工具失败显示
+    async def _blocked_tool_result(self, run_id: str, tool_call: ToolCallBlock) -> ToolResult:
+        text = _REPEAT_BLOCKED_TEXT.format(n=self._repeat_streak)
+        await self._bus.publish(
+            ToolCallStartedEvent(
+                run_id=run_id,
+                tool_use_id=tool_call.id,
+                tool_name=tool_call.name,
+                params=dict(tool_call.input),
+                ts=_now(),
+            )
+        )
+        await self._bus.publish(
+            ToolCallFailedEvent(
+                run_id=run_id,
+                tool_use_id=tool_call.id,
+                tool_name=tool_call.name,
+                error_class="repeat_loop",
+                error_message=text,
+                elapsed_ms=0,
+                ts=_now(),
+            )
+        )
+        return ToolResult(content=text, is_error=True, error_type="repeat_loop")
 
     # 发请求前预判：输入 + 输出预留装不下就先压缩；压缩不成再确定性降级，绝不硬发
     async def _ensure_fits(

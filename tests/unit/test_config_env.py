@@ -87,6 +87,36 @@ def test_priority_chain_full(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     assert cfg.port == 8000
 
 
+
+# 功能：JSON 配置里的 agent.repeat_limit 能被读到（重复调用闸门的阈值可配）
+# 设计：把 WEAVE_CONFIG 指向临时 JSON 并清掉同名环境变量，确认「配置文件」这条来源真的生效
+def test_agent_repeat_limit_from_json(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    json_path = tmp_path / "weave.json"
+    json_path.write_text('{"agent": {"repeat_limit": 7}}', encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("WEAVE_CONFIG", str(json_path))
+    monkeypatch.delenv("WEAVE_REPEAT_LIMIT", raising=False)
+
+    cfg = get_config()
+
+    assert cfg.agent.repeat_limit == 7
+
+
+# 功能：环境变量 WEAVE_REPEAT_LIMIT 的优先级高于 JSON 配置
+# 设计：JSON 写 7、环境变量写 9，断言最终为 9——锁住「环境变量在四级优先链顶层」这条约束
+def test_agent_repeat_limit_env_overrides_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    json_path = tmp_path / "weave.json"
+    json_path.write_text('{"agent": {"repeat_limit": 7}}', encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("WEAVE_CONFIG", str(json_path))
+    monkeypatch.setenv("WEAVE_REPEAT_LIMIT", "9")
+
+    cfg = get_config()
+
+    assert cfg.agent.repeat_limit == 9
+
 # 功能：JSON 配置里的 llm.stream_retries 能被读到（流式重试次数可配）
 # 设计：写一个非默认值（3）并断言生效——用默认值 5 无法区分「读到了」还是「用了默认」
 def test_llm_stream_retries_from_json(
