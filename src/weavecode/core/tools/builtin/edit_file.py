@@ -5,6 +5,11 @@ from pathlib import Path
 from pydantic import BaseModel, ConfigDict
 
 from weavecode.core.tools.base import BaseTool, ToolResult
+from weavecode.core.tools.file_mutation import (
+    DEFAULT_FILE_MUTATION,
+    EditRejectedError,
+    FileMutation,
+)
 
 
 class EditFileParams(BaseModel):
@@ -59,6 +64,10 @@ class EditFileTool(BaseTool):
         "required": ["path", "old_string", "new_string"],
     }
 
+    # 注入写入服务（默认用进程级单例；测试可传自己的实例以隔离锁表）
+    def __init__(self, mutation: FileMutation | None = None) -> None:
+        self._mutation = mutation or DEFAULT_FILE_MUTATION
+
     # 编辑已有文件（精确替换第一处）；只支持绝对路径；空串/新旧相同/不存在分报错；行尾归一化
     async def invoke(self, params: dict[str, object]) -> ToolResult:
         p = EditFileParams.model_validate(params)
@@ -105,32 +114,39 @@ class EditFileTool(BaseTool):
                 error_type="runtime_error",
             )
 
-        with path.open("r", encoding="utf-8", newline="") as f:
-            content = f.read()
-
-        ending = "\r\n" if "\r\n" in content else "\n"
-        old = _convert_to_line_ending(_normalize_line_endings(old_string), ending)
-        new = _convert_to_line_ending(_normalize_line_endings(new_string), ending)
-
-        if old == new:
+        # 行尾归一化对 old / new 是同一套变换，原始串相同就必然相同 → 提前判定，不必读文件
+        if old_string == new_string:
             return ToolResult(content="Old and new strings are identical; no change was made.")
 
-        count = content.count(old)
-        if count == 0:
-            return ToolResult(
-                content=(
+        box: dict[str, int] = {}
+
+        # 在文件锁内、线程里跑「读 → 改 → 写」；找不到 old_string 就抛错中止（绝不写）
+        def transform(content: str) -> str:
+            ending = "\r\n" if "\r\n" in content else "\n"
+            old = _convert_to_line_ending(_normalize_line_endings(old_string), ending)
+            new = _convert_to_line_ending(_normalize_line_endings(new_string), ending)
+            count = content.count(old)
+            if count == 0:
+                raise EditRejectedError(
                     "Could not find old_string in the file. "
                     "It must match exactly, including spaces, indentation, and line endings."
-                ),
+                )
+            box["count"] = count
+            return content.replace(old, new, 1)
+
+        try:
+            await self._mutation.edit(path, transform)
+        except EditRejectedError as exc:
+            return ToolResult(content=exc.message, is_error=True, error_type="runtime_error")
+        except OSError as exc:
+            return ToolResult(
+                content=f"Failed to edit {path}: {exc}",
                 is_error=True,
                 error_type="runtime_error",
             )
 
-        new_content = content.replace(old, new, 1)
-        with path.open("w", encoding="utf-8", newline="") as f:
-            f.write(new_content)
-
         msg = f"Edit applied successfully to {path}."
+        count = box.get("count", 1)
         if count > 1:
             msg += f" Note: old_string matched {count} locations; replaced the first one."
         return ToolResult(content=msg)

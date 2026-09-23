@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 from pathlib import Path
@@ -78,10 +79,11 @@ class GlobTool(BaseTool):
                 error_type="runtime_error",
             )
 
-        return _glob_sync(root, p.pattern)
+        # 磁盘 IO 放进线程：递归遍历大树时不让整个事件循环陪着卡住
+        return await asyncio.to_thread(_glob_sync, root, p.pattern)
 
 
-# 递归匹配文件名
+# 同步核心：递归匹配文件名（在线程里执行，整段不让出）
 def _glob_sync(root: Path, pattern: str) -> ToolResult:
     if not root.exists():
         return ToolResult(

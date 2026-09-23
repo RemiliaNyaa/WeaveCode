@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import fnmatch
 import re
 from pathlib import Path
@@ -95,10 +96,11 @@ class GrepTool(BaseTool):
                 error_type="runtime_error",
             )
 
-        return _grep_sync(path, rx, p.include)
+        # 磁盘 IO 放进线程：整棵目录树逐个读文件，是最重的一个工具，绝不能让事件循环陪着卡住
+        return await asyncio.to_thread(_grep_sync, path, rx, p.include)
 
 
-# 遍历 + 逐文件匹配
+# 同步核心：遍历 + 逐文件匹配（在线程里执行，整段不让出）
 def _grep_sync(path: Path, rx: re.Pattern[str], include: str) -> ToolResult:
     if not path.exists():
         return ToolResult(

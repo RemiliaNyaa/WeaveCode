@@ -5,6 +5,7 @@ from pathlib import Path
 from pydantic import BaseModel, ConfigDict
 
 from weavecode.core.tools.base import BaseTool, ToolResult
+from weavecode.core.tools.file_mutation import DEFAULT_FILE_MUTATION, FileMutation
 
 _MAX_BYTES = 1 * 1024 * 1024  # 1 MB
 
@@ -51,6 +52,10 @@ class WriteFileTool(BaseTool):
         "required": ["path", "content"],
     }
 
+    # 注入写入服务（默认用进程级单例；测试可传自己的实例以隔离锁表）
+    def __init__(self, mutation: FileMutation | None = None) -> None:
+        self._mutation = mutation or DEFAULT_FILE_MUTATION
+
     # 写入文件（不存在则创建并自动建父目录，存在则全量替换）；只支持绝对路径；超 1MB 拒绝
     async def invoke(self, params: dict[str, object]) -> ToolResult:
         p = WriteFileParams.model_validate(params)
@@ -77,8 +82,14 @@ class WriteFileTool(BaseTool):
                 error_type="runtime_error",
             )
 
-        path.parent.mkdir(parents=True, exist_ok=True)
-        # newline="" 关掉文本模式的行尾翻译：内容里是 \n 就写 \n，是 \r\n 就写 \r\n
-        with path.open("w", encoding="utf-8", newline="") as f:
-            f.write(content)
+        # 交给集中式写入服务：按规范化路径取锁 → 在线程里完成「建父目录 + 覆盖写」
+        try:
+            await self._mutation.write(path, content)
+        except OSError as exc:
+            return ToolResult(
+                content=f"Failed to write {path}: {exc}",
+                is_error=True,
+                error_type="runtime_error",
+            )
+
         return ToolResult(content=f"wrote {len(encoded)} bytes to {path}")

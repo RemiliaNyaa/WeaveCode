@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from difflib import get_close_matches
 from pathlib import Path
 
@@ -95,10 +96,11 @@ class ReadFileTool(BaseTool):
                 error_type="runtime_error",
             )
 
-        return _read_sync(path, p.offset, p.limit)
+        # 磁盘 IO 放进线程：读大文件时不让整个事件循环陪着卡住
+        return await asyncio.to_thread(_read_sync, path, p.offset, p.limit)
 
 
-# 读文件并渲染成带行号的文本
+# 同步核心：读文件并渲染成带行号的文本（在线程里执行，整段不让出）
 def _read_sync(path: Path, offset: int, limit: int) -> ToolResult:
     if not path.exists():
         raise FileNotFoundError(_missing_message(path))

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import math
 from difflib import get_close_matches
 from pathlib import Path
@@ -74,10 +75,11 @@ class ListDirTool(BaseTool):
                 error_type="runtime_error",
             )
 
-        return _list_sync(path, p.page)
+        # 磁盘 IO 放进线程：大目录遍历时不让整个事件循环陪着卡住
+        return await asyncio.to_thread(_list_sync, path, p.page)
 
 
-# 列目录并分页渲染
+# 同步核心：列目录并分页渲染（在线程里执行，整段不让出）
 def _list_sync(path: Path, page: int) -> ToolResult:
     if not path.exists():
         return ToolResult(
