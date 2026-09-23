@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -26,7 +27,9 @@ from weavecode.core.tools.registry import ToolRegistry
 
 if TYPE_CHECKING:
     from weavecode.core.compact.compactor import Compactor
+    from weavecode.core.permissions.manager import PermissionManager
     from weavecode.core.subagent.runs import BackgroundRuns, SubagentOutcome
+
 
 log = logging.getLogger(__name__)
 
@@ -47,14 +50,6 @@ _REPEAT_BLOCKED_TEXT = (
     "Change your approach: use different arguments, use another tool, or explain "
     "why you are stuck."
 )
-
-# 系统提示词基础段由 provider 持有，循环直接导入复用，避免同一份文本出现两处拷贝
-
-# 终止条件只有三条：
-#   LLM 返回 end_turn            → success
-#   步数达到 max_steps            → failed: exceeded_max_steps
-#   LLM 调用抛错 / 被 Ctrl+C 取消 → failed: llm_error / cancelled
-# 工具执行出错不终止：错误作为结果回填，让模型自己换方案
 
 
 def _now() -> str:
@@ -116,36 +111,34 @@ def _collected_text(outcomes: list[SubagentOutcome]) -> str:
 
 
 class AgentLoop:
-    # 初始化循环所需依赖：LLM provider、工具注册表、事件总线，以及可选的会话与压缩依赖
+    # 初始化循环所需依赖：LLM provider、工具注册表、事件总线，以及可选的权限管理器、压缩器和 session ID
     def __init__(
         self,
         provider: LLMProvider,
         registry: ToolRegistry,
         bus: EventBus,
         *,
-        session_id: str = "",
-        permission_manager: Any = None,
+        permission_manager: PermissionManager | None = None,
         compactor: Compactor | None = None,
         auto_compact: bool = True,
         reserve_tokens: int = 20_000,
         model: str = "",
+        session_id: str = "",
         working_dir: str = "",
         runs: BackgroundRuns | None = None,
         repeat_limit: int = 3,
+        registry_provider: Callable[[], Awaitable[ToolRegistry]] | None = None,
     ) -> None:
         self._provider = provider
         self._registry = registry
         self._bus = bus
-        # 会话标识与权限管理器由 runner 注入，工具调用前先过审批
-        self._session_id = session_id
         self._permission_manager = permission_manager
-        self._working_dir = working_dir
-        # 压缩在发请求前预判：装不下才压，压缩器缺席时循环照常跑
         self._compactor = compactor
         self._auto_compact = auto_compact
-        # 本次输出 + 估算容差的预留量，预算 = 模型窗口 - 预留
         self._reserve_tokens = reserve_tokens
         self._model = model
+        self._session_id = session_id
+        self._working_dir = working_dir
         # 后台子 Agent 登记表（只有主 Agent 有；子 Agent 为 None）
         self._runs = runs
         self._collect_nudges = 0
@@ -155,25 +148,29 @@ class AgentLoop:
         self._last_step_sig = ""
         self._repeat_streak = 0
         self._repeat_hits = 0
+        # 每步重建 registry 的工厂（有它才能让 MCP 工具变化在「下一步」就生效）
+        self._registry_provider = registry_provider
         self._projector = RequestProjector()
 
-
-    # 驱动 think → tool → observe 闭环，直到模型收工或步数用尽
+    # 驱动 plan→act→observe 循环直到上下文终止；CancelledError 向上传播
     async def run(self, context: ExecutionContext) -> None:
         while not context.is_done():
             context.step += 1
-            log.debug("step %d start run_id=%s", context.step, context.run_id)
+            # 每步取一次最新 registry：MCP server 发了「工具列表已变」通知时，通知 handler 只标脏，
+            # 这里重建 registry 就会把新工具带上 → 变化在「下一步」生效（没有脏 server 时零 I/O）
+            if self._registry_provider is not None:
+                self._registry = await self._registry_provider()
             await self._bus.publish(
                 StepStartedEvent(run_id=context.run_id, step=context.step, ts=_now())
             )
 
-            system = context.system_prompt(_SYSTEM_PROMPT)
+            system = await context.system_prompt_async(_SYSTEM_PROMPT)
             tools = self._registry.tool_schemas()
 
-            # 发请求前预判本次输入装不装得下；装不下先压缩，保证请求不被截断
+            # 发请求前预判本次输入装不装得下；装不下先压缩，保证请求正常执行不被截断
             await self._ensure_fits(context, system, tools)
 
-            # think：把当前历史交给 LLM，让它决定下一步做什么
+            # [plan] call LLM — API errors terminate the run
             sent_count = len(context.messages)
             try:
                 response = await self._provider.chat(
@@ -185,11 +182,12 @@ class AgentLoop:
                     system=system,
                 )
             except asyncio.CancelledError:
-                # 必须向上传播，让上层有机会在文件关闭后收尾
                 context.mark_failed("cancelled")
                 raise
             except Exception:
-                log.exception("LLM call failed run_id=%s step=%d", context.run_id, context.step)
+                logging.getLogger(__name__).exception(
+                    "LLM call failed run_id=%s step=%d", context.run_id, context.step
+                )
                 context.mark_failed("llm_error")
                 break
 
@@ -197,7 +195,8 @@ class AgentLoop:
             if response.usage is not None:
                 self._projector.observe(response.usage.input_tokens, sent_count)
 
-            # observe：响应先进历史，再执行工具——顺序反过来会破坏消息配对
+            # [observe] append assistant content blocks to context
+            # thinking blocks must come first and be preserved verbatim for extended thinking mode
             # 先归一化本步子 Agent 派发的模式，这样 transcript 记录的就是实际生效的参数
             _normalize_spawn_modes(response.tool_calls)
             blocks: list[dict[str, object]] = list(response.thinking_blocks)
@@ -209,7 +208,7 @@ class AgentLoop:
                 )
             context.add_assistant_message(blocks)
 
-            # act：逐个执行工具调用，失败结果同样回填给模型
+            # [act] execute each requested tool; errors become tool results so loop continues
             if response.stop_reason == "tool_use":
                 # 重复调用闸门：连续 N 步发出完全相同的调用 → 拦下（第 3 次拦截则终止 run）
                 blocked, terminate = self._repeat_gate(response.tool_calls)
@@ -220,19 +219,14 @@ class AgentLoop:
                         context.add_tool_result(tc.id, text, is_error=True)
                     context.mark_failed("repeat_loop")
                 else:
-                    # 会话标识随权限审批一起下发（审批按会话记缓存）；没接入审批链路时保持最简调用
-                    invoke_extra: dict[str, Any] = {}
-                    if self._permission_manager is not None:
-                        invoke_extra = {
-                            "permission_manager": self._permission_manager,
-                            "session_id": self._session_id,
-                            "working_dir": self._working_dir,
-                        }
-                    # 并发执行本轮所有工具调用；gather 按传入顺序返回，结果与调用一一配对
+                    # 并行执行本轮所有工具调用（含多个 spawn_agent）；结果按 tool_use_id 配对回填
                     results = await asyncio.gather(
                         *[
                             invoke_tool(
-                                self._registry, tc, self._bus, context.run_id, **invoke_extra
+                                self._registry, tc, self._bus, context.run_id,
+                                permission_manager=self._permission_manager,
+                                session_id=self._session_id,
+                                working_dir=self._working_dir,
                             )
                             if tc.id not in blocked
                             else self._blocked_tool_result(context.run_id, tc)
@@ -240,20 +234,19 @@ class AgentLoop:
                         ]
                     )
                     for tc, result in zip(response.tool_calls, results):
-                        context.add_tool_result(
-                            tc.id, result.content, is_error=result.is_error
-                        )
+                        context.add_tool_result(tc.id, result.content, is_error=result.is_error)
             elif response.stop_reason == "max_tokens" and response.tool_calls:
-                # 输出被 token 上限截断，工具调用只有半截：补一条错误结果保持配对完整
+                # Output token limit hit mid-tool-call; input is incomplete.
+                # Add synthetic error results so the conversation stays balanced.
                 for tc in response.tool_calls:
                     context.add_tool_result(
                         tc.id,
-                        "Error: output token limit reached before this tool call could be "
-                        "completed. Please break the task into smaller steps and try again.",
+                        "Error: output token limit reached before this tool call could be completed. "
+                        "Please break the task into smaller steps and try again.",
                         is_error=True,
                     )
 
-            # 终止检查 —— end_turn 赢过 max_steps，但还有后台子 Agent 时先不放行
+            # Termination check — end_turn wins over max_steps if both hit on same step
             if response.stop_reason == "end_turn":
                 pending = self._runs.pending_ids() if self._runs is not None else []
                 if pending and self._collect_nudges < _MAX_COLLECT_NUDGES:
@@ -276,6 +269,7 @@ class AgentLoop:
                     context.result = response.text or ""
                     context.mark_success()
             elif context.step >= context.max_steps and not context.is_done():
+                # 已经因其它原因（如重复调用死循环）失败时，不要覆盖掉原来的 reason
                 context.mark_failed("exceeded_max_steps")
 
             await self._bus.publish(

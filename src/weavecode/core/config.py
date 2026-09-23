@@ -53,12 +53,13 @@ class TraceConfig:
 @dataclass
 class PermissionConfig:
     timeout_s: float = 60.0  # 审批超时秒数；0 表示不超时
-    persist: bool = True  # 是否把「始终允许」的审批决定写入 policy.toml
 
 
 @dataclass
 class CompactionConfig:
-    auto_threshold: float = 0.8     # 上下文水位达到该比例才触发压缩（0 表示关闭）
+    auto: bool = True             # 是否启用自动压缩
+    reserve_tokens: int = 20_000  # 发请求前为本次输出 + 估算容差预留的 token
+    keep_tokens: int = 8_000      # 压缩后原样保留的最近历史 token 数
     tool_result_limit: int = 8_000  # tool_result 截断触发字符数
     tool_result_keep: int = 4_000   # 截断后保留的前缀字符数
 
@@ -77,6 +78,8 @@ class McpServerConfig:
 @dataclass
 class McpConfig:
     servers: list[McpServerConfig] = field(default_factory=list)
+    # 是否监听 server 的 notifications/tools/list_changed 并重拉工具清单（默认开）
+    refresh_on_notify: bool = True
 
 
 @dataclass
@@ -228,7 +231,7 @@ def _apply_json(config: WeaveConfig, data: dict[str, Any]) -> None:
         perm = data["permission"]
         if not isinstance(perm, dict):
             raise SystemExit("Config error: permission must be a table")
-        unknown_perm: set[str] = set(perm.keys()) - {"timeout_s", "persist"}
+        unknown_perm: set[str] = set(perm.keys()) - {"timeout_s"}
         if unknown_perm:
             raise SystemExit(f"Unknown permission keys: {', '.join(sorted(unknown_perm))}")
         if "timeout_s" in perm:
@@ -236,26 +239,31 @@ def _apply_json(config: WeaveConfig, data: dict[str, Any]) -> None:
             if not isinstance(val, (int, float)) or val < 0:
                 raise SystemExit("Config error: permission.timeout_s must be a non-negative number")
             config.permission.timeout_s = float(val)
-        if "persist" in perm:
-            val = perm["persist"]
-            if not isinstance(val, bool):
-                raise SystemExit("Config error: permission.persist must be a boolean")
-            config.permission.persist = val
 
     if "compaction" in data:
         comp = data["compaction"]
         if not isinstance(comp, dict):
             raise SystemExit("Config error: compaction must be a table")
         unknown_comp: set[str] = set(comp.keys()) - {
-            "auto_threshold", "tool_result_limit", "tool_result_keep",
+            "auto", "reserve_tokens", "keep_tokens", "tool_result_limit", "tool_result_keep",
         }
         if unknown_comp:
             raise SystemExit(f"Unknown compaction keys: {', '.join(sorted(unknown_comp))}")
-        if "auto_threshold" in comp:
-            val = comp["auto_threshold"]
-            if not isinstance(val, (int, float)) or val < 0 or val > 1:
-                raise SystemExit("Config error: compaction.auto_threshold must be within 0~1")
-            config.compaction.auto_threshold = float(val)
+        if "auto" in comp:
+            val = comp["auto"]
+            if not isinstance(val, bool):
+                raise SystemExit("Config error: compaction.auto must be a boolean")
+            config.compaction.auto = val
+        if "reserve_tokens" in comp:
+            val = comp["reserve_tokens"]
+            if not isinstance(val, int) or val < 0:
+                raise SystemExit("Config error: compaction.reserve_tokens must be non-negative")
+            config.compaction.reserve_tokens = val
+        if "keep_tokens" in comp:
+            val = comp["keep_tokens"]
+            if not isinstance(val, int) or val < 0:
+                raise SystemExit("Config error: compaction.keep_tokens must be non-negative")
+            config.compaction.keep_tokens = val
         if "tool_result_limit" in comp:
             val = comp["tool_result_limit"]
             if not isinstance(val, int) or val <= 0:
@@ -273,9 +281,14 @@ def _apply_json(config: WeaveConfig, data: dict[str, Any]) -> None:
         mcp = data["mcp"]
         if not isinstance(mcp, dict):
             raise SystemExit("Config error: mcp must be a table")
-        unknown_mcp: set[str] = set(mcp.keys()) - {"mcpServers"}
+        unknown_mcp: set[str] = set(mcp.keys()) - {"mcpServers", "refreshOnNotify"}
         if unknown_mcp:
             raise SystemExit(f"Unknown mcp keys: {', '.join(sorted(unknown_mcp))}")
+        if "refreshOnNotify" in mcp:
+            val = mcp["refreshOnNotify"]
+            if not isinstance(val, bool):
+                raise SystemExit("Config error: mcp.refreshOnNotify must be a boolean")
+            config.mcp.refresh_on_notify = val
         servers_raw = mcp.get("mcpServers", {})
         if not isinstance(servers_raw, dict):
             raise SystemExit("Config error: mcp.mcpServers must be an object of server configs")
@@ -380,6 +393,18 @@ def _apply_env(config: WeaveConfig) -> None:
                 f"Config error: WEAVE_REPEAT_LIMIT must be an integer, got: {repeat_limit_str!r}"
             )
 
+    mcp_refresh = os.environ.get("WEAVE_MCP_REFRESH_ON_NOTIFY")
+    if mcp_refresh is not None:
+        if mcp_refresh.strip().lower() in {"1", "true", "yes", "on"}:
+            config.mcp.refresh_on_notify = True
+        elif mcp_refresh.strip().lower() in {"0", "false", "no", "off"}:
+            config.mcp.refresh_on_notify = False
+        else:
+            raise SystemExit(
+                "Config error: WEAVE_MCP_REFRESH_ON_NOTIFY must be a boolean,"
+                f" got: {mcp_refresh!r}"
+            )
+
     default_model = os.environ.get("WEAVE_LLM_DEFAULT_MODEL")
     if default_model is not None:
         config.llm.default_model = default_model
@@ -426,31 +451,43 @@ def _apply_env(config: WeaveConfig) -> None:
                 f"Config error: WEAVE_PERMISSION_TIMEOUT_S must be a number, got: {perm_timeout!r}"
             )
 
-    perm_persist = os.environ.get("WEAVE_PERMISSION_PERSIST")
-    if perm_persist is not None:
-        if perm_persist.strip().lower() in ("1", "true", "yes", "on"):
-            config.permission.persist = True
-        elif perm_persist.strip().lower() in ("0", "false", "no", "off"):
-            config.permission.persist = False
-        else:
+    compact_auto = os.environ.get("WEAVE_COMPACT_AUTO")
+    if compact_auto is not None:
+        normalized = compact_auto.strip().lower()
+        if normalized not in ("1", "true", "yes", "on", "0", "false", "no", "off"):
             raise SystemExit(
-                f"Config error: WEAVE_PERMISSION_PERSIST must be a boolean, got: {perm_persist!r}"
+                f"Config error: WEAVE_COMPACT_AUTO must be a boolean, got: {compact_auto!r}"
             )
+        config.compaction.auto = normalized in ("1", "true", "yes", "on")
 
-    compact_threshold = os.environ.get("WEAVE_COMPACT_THRESHOLD")
-    if compact_threshold is not None:
+    compact_reserve = os.environ.get("WEAVE_COMPACT_RESERVE")
+    if compact_reserve is not None:
         try:
-            compact_threshold_val = float(compact_threshold)
-            if compact_threshold_val < 0 or compact_threshold_val > 1:
+            compact_reserve_val = int(compact_reserve)
+            if compact_reserve_val < 0:
                 raise SystemExit(
-                    "Config error: WEAVE_COMPACT_THRESHOLD must be within 0~1,"
-                    f" got: {compact_threshold!r}"
+                    "Config error: WEAVE_COMPACT_RESERVE must be a non-negative integer, "
+                    f"got: {compact_reserve!r}"
                 )
-            config.compaction.auto_threshold = compact_threshold_val
+            config.compaction.reserve_tokens = compact_reserve_val
         except ValueError:
             raise SystemExit(
-                "Config error: WEAVE_COMPACT_THRESHOLD must be a number, "
-                f"got: {compact_threshold!r}"
+                f"Config error: WEAVE_COMPACT_RESERVE must be an integer, got: {compact_reserve!r}"
+            )
+
+    compact_keep = os.environ.get("WEAVE_COMPACT_KEEP")
+    if compact_keep is not None:
+        try:
+            compact_keep_val = int(compact_keep)
+            if compact_keep_val < 0:
+                raise SystemExit(
+                    "Config error: WEAVE_COMPACT_KEEP must be a non-negative integer, "
+                    f"got: {compact_keep!r}"
+                )
+            config.compaction.keep_tokens = compact_keep_val
+        except ValueError:
+            raise SystemExit(
+                f"Config error: WEAVE_COMPACT_KEEP must be an integer, got: {compact_keep!r}"
             )
 
     compact_tool_limit = os.environ.get("WEAVE_COMPACT_TOOL_LIMIT")

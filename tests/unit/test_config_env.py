@@ -87,7 +87,6 @@ def test_priority_chain_full(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     assert cfg.port == 8000
 
 
-
 # 功能：JSON 配置里的 agent.repeat_limit 能被读到（重复调用闸门的阈值可配）
 # 设计：把 WEAVE_CONFIG 指向临时 JSON 并清掉同名环境变量，确认「配置文件」这条来源真的生效
 def test_agent_repeat_limit_from_json(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -116,6 +115,39 @@ def test_agent_repeat_limit_env_overrides_json(
     cfg = get_config()
 
     assert cfg.agent.repeat_limit == 9
+
+
+# 功能：JSON 配置里的 mcp.refreshOnNotify 能被读到（默认 true，可关掉通知驱动的刷新）
+# 设计：显式写 false 并断言生效——默认值 true 时无法区分「读到了」还是「用了默认」，必须写非默认值
+def test_mcp_refresh_on_notify_from_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    json_path = tmp_path / "weave.json"
+    json_path.write_text('{"mcp": {"refreshOnNotify": false}}', encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("WEAVE_CONFIG", str(json_path))
+    monkeypatch.delenv("WEAVE_MCP_REFRESH_ON_NOTIFY", raising=False)
+
+    cfg = get_config()
+
+    assert cfg.mcp.refresh_on_notify is False
+
+
+# 功能：环境变量 WEAVE_MCP_REFRESH_ON_NOTIFY 的优先级高于 JSON 配置
+# 设计：JSON 写 false、环境变量写 true，断言最终为 true——锁住「环境变量在四级优先链顶层」
+def test_mcp_refresh_on_notify_env_overrides_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    json_path = tmp_path / "weave.json"
+    json_path.write_text('{"mcp": {"refreshOnNotify": false}}', encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("WEAVE_CONFIG", str(json_path))
+    monkeypatch.setenv("WEAVE_MCP_REFRESH_ON_NOTIFY", "true")
+
+    cfg = get_config()
+
+    assert cfg.mcp.refresh_on_notify is True
+
 
 # 功能：JSON 配置里的 llm.stream_retries 能被读到（流式重试次数可配）
 # 设计：写一个非默认值（3）并断言生效——用默认值 5 无法区分「读到了」还是「用了默认」

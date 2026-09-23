@@ -170,6 +170,22 @@ class AgentRunner:
                     runs=runs,
                 )
                 compactor = Compactor(bus, session_id=session_id)
+
+                # 每步重建 registry 的工厂：先让 MCP 重拉「被通知标脏」的 server（无脏则零 I/O），
+                # 再按当前条件组装 registry —— 这样 MCP 工具变化能在下一步就生效
+                async def _registry_provider() -> ToolRegistry:
+                    if self._mcp_manager is not None:
+                        await self._mcp_manager.refresh_dirty()
+                    return self._build_registry(
+                        plan_storage,
+                        run_id=run_id,
+                        provider=provider,
+                        bus=bus,
+                        session_id=session_id,
+                        working_dir=working_dir,
+                        runs=runs,
+                    )
+
                 loop = AgentLoop(
                     provider,
                     registry,
@@ -183,6 +199,7 @@ class AgentRunner:
                     working_dir=working_dir,
                     runs=runs,
                     repeat_limit=self._config.agent.repeat_limit,
+                    registry_provider=_registry_provider,
                 )
                 await loop.run(context)
             except asyncio.CancelledError:
