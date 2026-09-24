@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import sqlite3
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
@@ -196,7 +198,7 @@ def build_prompt(material: str, prior_summary: str | None, focus: str = "") -> s
 
 
 class Compactor:
-    # 初始化压缩器，绑定事件总线、数据库连接、session ID 与保留窗口
+    # 初始化压缩器，绑定事件总线、db、session ID 与保留窗口
     def __init__(
         self,
         bus: EventBus,
@@ -210,7 +212,7 @@ class Compactor:
         self._session_id = session_id
         self._keep_tokens = keep_tokens
 
-    # 压缩 ExecutionContext.messages，就地替换为 [checkpoint, 确认] 并广播压缩事件
+    # 压缩 ExecutionContext.messages，就地替换为 [checkpoint, 确认] 并把摘要落库
     async def compact(
         self,
         context: ExecutionContext,
@@ -222,6 +224,7 @@ class Compactor:
             return None
 
         context.messages = result.as_messages()
+        await self._write_summary(result.summary_text)
         await self._bus.publish(
             ContextCompactedEvent(
                 session_id=self._session_id,
@@ -266,17 +269,19 @@ class Compactor:
             summary_tokens=summary_tokens,
         )
 
-    # 调用一次独立 LLM 生成摘要；附带空总线与空工具集，失败或空摘要返回 None
+    # 调用一次独立 LLM 生成摘要；附带 silent bus 与空工具集，失败或空摘要返回 None
     async def _summarize(
         self,
         prompt: str,
         provider: LLMProvider,
     ) -> tuple[str, int] | None:
+        from weavecode.core.events.bus import EventBus as _Bus
+
         try:
             response = await provider.chat(
                 messages=[{"role": "user", "content": prompt}],
                 tool_schemas=[],
-                bus=EventBus(),
+                bus=_Bus(),
                 run_id="compact",
                 step=0,
                 system=_SUMMARIZER_SYSTEM,
@@ -293,6 +298,28 @@ class Compactor:
             response.usage.output_tokens if response.usage else len(summary_text) // 4
         )
         return summary_text, summary_tokens
+
+    # 把摘要文本写进 summary 表；无 db / 无 session 时静默跳过，落库失败只记日志
+    async def _write_summary(self, text: str) -> None:
+        if self._db is None or not self._session_id:
+            return
+        try:
+            await save_summary(self._db, self._session_id, text)
+        except sqlite3.Error:
+            logger.exception("compactor: failed to save summary")
+
+
+# 把摘要文本写进 summary 表（一个 session 可有多条，按时间累积）
+async def save_summary(db: Database, session_id: str, text: str) -> None:
+    now = int(time.time() * 1000)
+
+    def _write(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            "INSERT INTO summary (session_id, text, time_created) VALUES (?, ?, ?)",
+            (session_id, text, now),
+        )
+
+    await db.transaction(_write)
 
 
 # 将消息列表序列化为可供 LLM 阅读的纯文本

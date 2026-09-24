@@ -169,7 +169,12 @@ class AgentRunner:
                     working_dir=working_dir,
                     runs=runs,
                 )
-                compactor = Compactor(bus, session_id=session_id)
+                compactor = Compactor(
+                    bus,
+                    self._db,
+                    session_id,
+                    keep_tokens=self._config.compaction.keep_tokens,
+                )
 
                 # 每步重建 registry 的工厂：先让 MCP 重拉「被通知标脏」的 server（无脏则零 I/O），
                 # 再按当前条件组装 registry —— 这样 MCP 工具变化能在下一步就生效

@@ -129,8 +129,31 @@ def _migration_4(conn: sqlite3.Connection) -> None:
         conn.execute(statement)
 
 
+# 迁移 5：压缩摘要（原来每个摘要一个 summary_<ts>.md 文件）
+#
+# 只存摘要文本本身：文件里原本也只有文本（文件名带时间戳只是为了不互相覆盖），
+# 迁到 DB 后时间戳变成 time_created 一列，不再需要靠文件名区分。
+# 注意：这张表目前是**只写不读**的留痕（摘要的实际用途是内存里的 checkpoint），与原来的文件一致。
+_STATEMENTS_5 = (
+    "CREATE TABLE summary ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  session_id TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE,"
+    "  text TEXT NOT NULL,"  # 摘要正文
+    "  time_created INTEGER NOT NULL"
+    ")",
+    "CREATE INDEX summary_session_idx ON summary(session_id, id)",
+)
+
+
+# 建 summary 表
+def _migration_5(conn: sqlite3.Connection) -> None:
+    for statement in _STATEMENTS_5:
+        conn.execute(statement)
+
+
 # 注册迁移（版本号从 1 起，只往后追加）
 MIGRATIONS.append((1, "session_and_messages", _migration_1))
 MIGRATIONS.append((2, "event_stream", _migration_2))
 MIGRATIONS.append((3, "permission", _migration_3))
 MIGRATIONS.append((4, "todo", _migration_4))
+MIGRATIONS.append((5, "summary", _migration_5))

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -16,6 +17,7 @@ from weavecode.core.compact.compactor import (
 from weavecode.core.context import ExecutionContext
 from weavecode.core.events.bus import EventBus
 from weavecode.core.llm.types import LlmResponse, UsageStats
+from weavecode.core.storage import Database, apply_migrations
 
 
 def _stub_provider(summary: str = "## 1. Original Goal\nTest\n## 2. Completed Steps\n- done") -> Any:
@@ -41,7 +43,7 @@ def _make_messages(n: int = 5) -> list[dict[str, Any]]:
 def test_compact_messages_calls_provider(tmp_path: Path) -> None:
     provider = _stub_provider()
     bus = EventBus()
-    compactor = Compactor(bus, tmp_path, "sess-1")
+    compactor = Compactor(bus, None, "sess-1")
     messages = _make_messages()
 
     result = asyncio.get_event_loop().run_until_complete(
@@ -60,7 +62,7 @@ def test_compact_messages_returns_summary(tmp_path: Path) -> None:
     expected = "## 1. Original Goal\nDo X\n## 2. Completed\n- step one"
     provider = _stub_provider(summary=expected)
     bus = EventBus()
-    compactor = Compactor(bus, tmp_path, "sess-1")
+    compactor = Compactor(bus, None, "sess-1")
 
     result = asyncio.get_event_loop().run_until_complete(
         compactor.compact_messages(_make_messages(), provider)
@@ -75,7 +77,7 @@ def test_compact_messages_returns_summary(tmp_path: Path) -> None:
 def test_compact_replaces_context_messages(tmp_path: Path) -> None:
     provider = _stub_provider()
     bus = EventBus()
-    compactor = Compactor(bus, tmp_path, "sess-1")
+    compactor = Compactor(bus, None, "sess-1")
     ctx = ExecutionContext(run_id="r1", goal="test", max_steps=5)
     ctx.messages = _make_messages()
 
@@ -85,6 +87,55 @@ def test_compact_replaces_context_messages(tmp_path: Path) -> None:
     assert ctx.messages[0]["role"] == "user"
     assert ctx.messages[1]["role"] == "assistant"
 
+
+# 功能：验证 compact() 把摘要文本写进 summary 表
+# 设计：用 tmp_path 建真实 db（先插 project + session 满足外键），调用 compact() 后查表断言摘要落库
+async def test_compact_saves_summary(tmp_path: Path) -> None:
+    db = Database(tmp_path / "test.db")
+    await apply_migrations(db)
+
+    def _seed(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            "INSERT INTO project (id, worktree, name, time_created, time_updated) "
+            "VALUES ('p1', '/proj', '', 0, 0)"
+        )
+        conn.execute(
+            "INSERT INTO session (id, project_id, mode, status, title, directory, run_ids, "
+            "time_created, time_updated) VALUES ('sess-1', 'p1', 'chat', 'active', '', "
+            "'/proj', '[]', 0, 0)"
+        )
+
+    await db.run(_seed)
+
+    provider = _stub_provider()
+    compactor = Compactor(EventBus(), db, "sess-1")
+    ctx = ExecutionContext(run_id="r1", goal="test", max_steps=5)
+    ctx.messages = _make_messages()
+
+    await compactor.compact(ctx, provider)
+
+    def _read(conn: sqlite3.Connection) -> list[str]:
+        rows = conn.execute(
+            "SELECT text FROM summary WHERE session_id = ?", ("sess-1",)
+        ).fetchall()
+        return [str(r["text"]) for r in rows]
+
+    texts = await db.run(_read)
+    assert len(texts) == 1
+    assert "## 1. Original Goal" in texts[0]
+
+
+# 功能：验证 db 为 None 时压缩照常完成、只是不落库
+# 设计：传 None 作 db 调用 compact()，断言不抛异常且 context 仍被替换 —— 无存储场景（CLI/单测）的降级路径
+def test_compact_without_db_still_works(tmp_path: Path) -> None:
+    provider = _stub_provider()
+    compactor = Compactor(EventBus(), None, "sess-1")
+    ctx = ExecutionContext(run_id="r1", goal="test", max_steps=5)
+    ctx.messages = _make_messages()
+
+    asyncio.get_event_loop().run_until_complete(compactor.compact(ctx, provider))
+
+    assert len(ctx.messages) == 2
 
 
 # 功能：验证 compact() 成功后发布 ContextCompactedEvent 事件
@@ -98,7 +149,7 @@ def test_compact_publishes_event(tmp_path: Path) -> None:
         received.append(event)
 
     bus.subscribe(handler)
-    compactor = Compactor(bus, tmp_path, "sess-1")
+    compactor = Compactor(bus, None, "sess-1")
     ctx = ExecutionContext(run_id="r1", goal="test", max_steps=5)
     ctx.messages = _make_messages()
 
@@ -107,13 +158,14 @@ def test_compact_publishes_event(tmp_path: Path) -> None:
     types = [getattr(e, "type", None) for e in received]
     assert "context.compacted" in types
 
+
 # 功能：验证 provider 抛异常时 context.messages 保持不变
 # 设计：stub provider.chat 抛 RuntimeError，断言 compact() 返回 None 且 messages 未被修改
 def test_compact_failure_preserves_context(tmp_path: Path) -> None:
     provider = MagicMock()
     provider.chat = AsyncMock(side_effect=RuntimeError("LLM error"))
     bus = EventBus()
-    compactor = Compactor(bus, tmp_path, "sess-1")
+    compactor = Compactor(bus, None, "sess-1")
     ctx = ExecutionContext(run_id="r1", goal="test", max_steps=5)
     original_messages = _make_messages()
     ctx.messages = list(original_messages)
