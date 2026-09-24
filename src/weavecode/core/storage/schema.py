@@ -82,6 +82,29 @@ def _migration_2(conn: sqlite3.Connection) -> None:
         conn.execute(statement)
 
 
+# 迁移 3：权限持久化（对齐 opencode 的 permission）
+#
+# **只换介质，不改维度**——现有 policy.toml 的规则就是 (project, permission, resource) 三元组，
+# 迁到 DB 后仍是这三列，不趁机加 action/时间戳等新维度（那些等真要用了再说）。
+# project 直接存字符串（= 项目根目录），**不建外键**：现有维度里它就是路径，建 FK 反而要加映射层。
+_STATEMENTS_3 = (
+    "CREATE TABLE permission ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  project TEXT NOT NULL,"  # 项目根目录（绝对路径）
+    "  permission TEXT NOT NULL,"  # 权限名，如 external_directory / bash
+    "  resource TEXT NOT NULL,"  # 具体资源；工具层恒为 '*'
+    "  time_created INTEGER NOT NULL"
+    ")",
+    "CREATE UNIQUE INDEX permission_unique_idx ON permission(project, permission, resource)",
+)
+
+
+# 建 permission 表
+def _migration_3(conn: sqlite3.Connection) -> None:
+    for statement in _STATEMENTS_3:
+        conn.execute(statement)
+
+
 # 迁移 4：任务列表（对齐 opencode 的 todo）
 #
 # **只换介质，不改维度**——现有 PlanItem 就是 (step, status) 两个字段（写在 tasks.json 里），
@@ -109,4 +132,5 @@ def _migration_4(conn: sqlite3.Connection) -> None:
 # 注册迁移（版本号从 1 起，只往后追加）
 MIGRATIONS.append((1, "session_and_messages", _migration_1))
 MIGRATIONS.append((2, "event_stream", _migration_2))
+MIGRATIONS.append((3, "permission", _migration_3))
 MIGRATIONS.append((4, "todo", _migration_4))

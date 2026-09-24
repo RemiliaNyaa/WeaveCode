@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from pathlib import Path
 from typing import Any
 
 from weavecode.core.permissions.manager import EXTERNAL_DIRECTORY, PermissionManager
@@ -13,9 +14,13 @@ from weavecode.core.permissions.policy import (
     evaluate_hard,
     evaluate_soft,
 )
+from weavecode.core.permissions.storage import load_policy, save_rule
+from weavecode.core.storage import Database, apply_migrations
 
-# bash / write_file 默认询问；测审批/缓存/超时机制时，
-# 用这个 helper 把 bash 固定为 ASK，避免依赖默认值。
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+# 工具层默认已改为全部 ALLOW（对齐 opencode）；测审批/缓存/超时机制时，
+# 用这个 helper 在完整默认策略之上把 bash 设为 ASK，避免依赖默认值。
 def _ask_bash_policies() -> dict[str, ToolPolicy]:
     merged = dict(DEFAULT_POLICIES)
     merged["bash"] = ToolPolicy(default=PermissionDecision.ASK)
@@ -23,10 +28,17 @@ def _ask_bash_policies() -> dict[str, ToolPolicy]:
 
 
 def _make_manager(**policies: ToolPolicy) -> PermissionManager:
-    # policy_file=None：不读写用户真实规则文件，测试不污染 ~/.weave
+    # db=None：测试中不使用持久化，不污染 ~/.weave/weave.db
     merged = _ask_bash_policies()
     merged.update(policies)
-    return PermissionManager(merged, policy_file=None)
+    return PermissionManager(merged)
+
+
+# 造一个建好表、指向临时目录的 db（权限持久化测试用）
+async def _db(tmp_path: Path) -> Database:
+    db = Database(tmp_path / "test.db")
+    await apply_migrations(db)
+    return db
 
 
 async def _collect_emitted() -> tuple[list[dict[str, Any]], Any]:
@@ -41,17 +53,17 @@ async def _collect_emitted() -> tuple[list[dict[str, Any]], Any]:
 # ── evaluate 委托与 hard/soft 纯函数 ─────────────────────────────────────────
 
 # 功能：验证默认策略（DEFAULT_POLICIES）与 evaluate 委托
-# 设计：只读工具默认放行、影响外部世界的操作默认询问；未登记工具走 ASK 兜底
+# 设计：工具层默认全部 ALLOW（对齐 opencode）；未登记工具走 ASK 兜底；验证委托路径正确
 def test_evaluate_delegates_to_policy() -> None:
-    mgr = PermissionManager(policy_file=None)
+    mgr = PermissionManager()
     assert mgr.evaluate("read_file", {"path": "x"}) == PermissionDecision.ALLOW
-    assert mgr.evaluate("bash", {"command": "echo hi"}) == PermissionDecision.ASK
-    assert mgr.evaluate("write_file", {"path": "x", "content": ""}) == PermissionDecision.ASK
+    assert mgr.evaluate("bash", {"command": "echo hi"}) == PermissionDecision.ALLOW
+    assert mgr.evaluate("write_file", {"path": "x", "content": ""}) == PermissionDecision.ALLOW
     # 未登记工具（如 MCP）→ ASK 兜底
     assert mgr.evaluate("exa__web_search", {"query": "x"}) == PermissionDecision.ASK
 
 
-# 功能：验证 evaluate_hard 只处理危险命令黑名单；越界走路径提取层 + external_directory
+# 功能：验证 evaluate_hard 只处理危险命令黑名单；越界走 tree-sitter + external_directory
 # 设计：危险命令返回 ASK；普通命令 / 绝对路径命令返回 None；非 bash 无硬规则
 def test_evaluate_hard_dangerous_only() -> None:
     bash = ToolPolicy(default=PermissionDecision.ALLOW)
@@ -62,7 +74,7 @@ def test_evaluate_hard_dangerous_only() -> None:
 
 
 # 功能：验证 evaluate_soft 直接返回该工具的默认策略
-# 设计：软规则不读任何名单，只返回传入策略的 default
+# 设计：软规则不再读任何名单，只返回 default
 def test_evaluate_soft_returns_default() -> None:
     assert evaluate_soft("bash", {"command": "ls -la"}, ToolPolicy(default=PermissionDecision.ALLOW)) == PermissionDecision.ALLOW
     assert evaluate_soft("bash", {"command": "cat x"}, ToolPolicy(default=PermissionDecision.ASK)) == PermissionDecision.ASK
@@ -168,7 +180,7 @@ async def test_check_and_wait_reject_once_returns_false() -> None:
     assert res.decision == "reject_once"
 
 
-# ── always_allow cache ───────────────────────────────────────────────────────
+# ── always_allow cache ────────────────────────────────────────────────────────
 
 # 功能：验证 respond("always_allow") 后同 session 同权限下次不再发事件
 # 设计：第二次调用 check_and_wait 命中 always 缓存，直接返回 auto_allow，emitted 仍为 1 条
@@ -352,7 +364,7 @@ async def test_always_allow_bash_does_not_bypass_outside_dir() -> None:
 
 # 功能：验证 bash 命令中的越界路径被 tree-sitter 提取并先触发越界审批
 # 设计：working_dir=/proj，`cat /etc/hosts` 的绝对路径参数被提取 → 先问 external_directory；
-#       随后 bash 工具级也 ASK（默认策略），故对每个请求都自动 allow_once
+#       随后 bash 工具级也 ASK（默认策略），故对每个请求都自动 allow_once（与 opencode 同为两次审批）
 async def test_bash_outside_path_triggers_ask() -> None:
     mgr = _make_manager()
     emitted: list[dict[str, Any]] = []
@@ -518,14 +530,62 @@ async def test_subagent_inherits_outside_approval() -> None:
     assert res.decision == "auto_allow"
 
 
+# ── 持久化 always 落库 ────────────────────────────────────────────────────────
+
+# 功能：验证 always_allow 决策写进 permission 表，新 PermissionManager 加载后自动放行
+# 设计：用 tmp_path 建真实 db，断言表里记录了 (project, permission, resource)；
+#       再新建 manager 并传入 load_policy 读出的规则，同项目同权限无需 ASK 直接返回 auto_allow
+async def test_persistent_always_saved_and_reloaded(tmp_path: Path) -> None:
+    db = await _db(tmp_path)
+    mgr = PermissionManager(policies=_ask_bash_policies(), db=db)
+    emitted, emitter = await _collect_emitted()
+
+    async def _auto_always() -> None:
+        await asyncio.sleep(0)
+        mgr.respond("tp1", "always_allow")
+
+    t = asyncio.create_task(_auto_always())
+    res = await mgr.check_and_wait(
+        tool_use_id="tp1", tool_name="bash",
+        params={"command": "echo"}, session_id="s1",
+        event_emitter=emitter,
+        working_dir="/proj",
+    )
+    await t
+    assert res.allowed is True
+    assert ("/proj", "bash", "*") in await load_policy(db)
+
+    # 新 manager 用同一 db 读出的规则，同项目 bash 应直接 auto_allow（无 OUTSIDE_CWD）
+    mgr2 = PermissionManager(
+        policies=_ask_bash_policies(), db=db, saved=await load_policy(db)
+    )
+    emitted2, emitter2 = await _collect_emitted()
+    res2 = await mgr2.check_and_wait(
+        tool_use_id="tp2", tool_name="bash",
+        params={"command": "echo new"}, session_id="s2",
+        event_emitter=emitter2,
+        working_dir="/proj",
+    )
+    assert res2.allowed is True
+    assert res2.decision == "auto_allow"
+    assert emitted2 == []  # 无需 ASK
+
+
+# 功能：同一三元组重复写入不产生重复行（唯一索引 + DO NOTHING 幂等）
+# 设计：直接对同一规则调两次 save_rule，断言 permission 表只有一行 —— 直测 upsert 幂等，不绕道审批流程
+async def test_save_rule_is_idempotent(tmp_path: Path) -> None:
+    db = await _db(tmp_path)
+    await save_rule(db, ("/proj", "bash", "*"))
+    await save_rule(db, ("/proj", "bash", "*"))
+    assert await load_policy(db) == [("/proj", "bash", "*")]
+
+
 # ── 审批超时 ──────────────────────────────────────────────────────────────────
 
 # 功能：验证 check_and_wait 超时后返回 allowed=False、decision="timeout"，不永久挂起
 # 设计：timeout_s=0.05 极短超时，不主动 respond；断言在合理时间内返回
 async def test_permission_timeout_returns_false() -> None:
-    mgr = PermissionManager(
-        policies=_ask_bash_policies(), policy_file=None, timeout_s=0.05
-    )
+    mgr = PermissionManager(policies=_ask_bash_policies(), timeout_s=0.05)
     emitted, emitter = await _collect_emitted()
 
     res = await mgr.check_and_wait(
@@ -544,9 +604,7 @@ async def test_permission_timeout_returns_false() -> None:
 # 设计：超时后调用 respond，不抛异常（unknown tool_use_id 静默忽略）；
 #       并断言 pending 表已清空
 async def test_permission_timeout_cleans_up_pending() -> None:
-    mgr = PermissionManager(
-        policies=_ask_bash_policies(), policy_file=None, timeout_s=0.05
-    )
+    mgr = PermissionManager(policies=_ask_bash_policies(), timeout_s=0.05)
     _, emitter = await _collect_emitted()
 
     await mgr.check_and_wait(
@@ -557,3 +615,66 @@ async def test_permission_timeout_cleans_up_pending() -> None:
     # 超时后迟到的 respond 不应 crash
     mgr.respond("t_late", "allow_once")  # should be noop
     assert "t_late" not in mgr._pending
+
+
+# ── 危险命令黑名单：硬规则，不可被「始终允许」绕过 ─────────────────────────────
+
+# 功能：验证危险命令（rm -rf）即使已「始终允许 bash」也强制审批
+# 设计：先对 bash 记 always_allow；再执行 rm -rf /tmp/x；
+#       危险黑名单是硬规则、排在缓存之前，应仍发出 permission.requested
+async def test_dangerous_command_asks_even_after_always_allow() -> None:
+    mgr = _make_manager()
+    emitted, emitter = await _collect_emitted()
+
+    async def _auto_always() -> None:
+        await asyncio.sleep(0)
+        mgr.respond("d1", "always_allow")
+
+    t = asyncio.create_task(_auto_always())
+    await mgr.check_and_wait(
+        tool_use_id="d1", tool_name="bash",
+        params={"command": "echo ok"}, session_id="s1",
+        event_emitter=emitter,
+    )
+    await t
+    assert len(emitted) == 1  # 首次 ASK 并记住 always_allow
+
+    async def _auto_deny() -> None:
+        await asyncio.sleep(0)
+        mgr.respond("d2", "reject_once")
+
+    t2 = asyncio.create_task(_auto_deny())
+    res = await mgr.check_and_wait(
+        tool_use_id="d2", tool_name="bash",
+        params={"command": "rm -rf /tmp/x"}, session_id="s1",
+        event_emitter=emitter,
+        working_dir="/proj",
+    )
+    await t2
+
+    assert res.allowed is False
+    assert len(emitted) == 2  # 危险命令仍触发审批，未被 always_allow 绕过
+
+
+# 功能：验证危险命令在工作目录内也拦截（补上纯越界方案拦不住的场景）
+# 设计：`rm -rf ./build` 路径在工作目录内（越界层不拦），但命中危险黑名单 → 强制审批
+async def test_dangerous_command_inside_working_dir_asks() -> None:
+    mgr = _make_manager()
+    emitted, emitter = await _collect_emitted()
+
+    async def _auto_allow() -> None:
+        await asyncio.sleep(0)
+        mgr.respond("d3", "allow_once")
+
+    t = asyncio.create_task(_auto_allow())
+    res = await mgr.check_and_wait(
+        tool_use_id="d3", tool_name="bash",
+        params={"command": "rm -rf ./build"}, session_id="s1",
+        event_emitter=emitter,
+        working_dir="/proj",
+    )
+    await t
+
+    assert res.allowed is True
+    assert len(emitted) == 1
+    assert emitted[0]["permission"] == "bash"  # 工具层（危险黑名单）触发，而非越界层

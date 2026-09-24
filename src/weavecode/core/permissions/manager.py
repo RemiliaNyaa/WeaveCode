@@ -17,12 +17,8 @@ from weavecode.core.permissions.policy import (
     ToolPolicy,
     param_preview,
 )
-from weavecode.core.permissions.storage import (
-    POLICY_FILE,
-    Rule,
-    load_policy,
-    save_policy_file,
-)
+from weavecode.core.permissions.storage import Rule, save_rule
+from weavecode.core.storage.database import Database
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +48,8 @@ class PermissionManager:
         self,
         policies: dict[str, ToolPolicy] | None = None,
         *,
-        policy_file: str | None = POLICY_FILE,
+        db: Database | None = None,
+        saved: list[Rule] | None = None,
         timeout_s: float = 60.0,
     ) -> None:
         self._policies: dict[str, ToolPolicy] = policies or dict(DEFAULT_POLICIES)
@@ -60,21 +57,22 @@ class PermissionManager:
         self._pending: dict[str, _PendingRequest] = {}
         # (session_id, permission) → "allow"（session 内存，重启丢失）
         self._session_always: dict[tuple[str, str], str] = {}
-        # 持久化规则：(project, permission, resource)，从规则文件加载
-        self._saved: list[Rule] = list(load_policy(policy_file)) if policy_file else []
-        self._policy_file = policy_file
+        self._db = db
+        # 持久化规则：(project, permission, resource)，由调用方从 permission 表读出后传入
+        self._saved: list[Rule] = list(saved or [])
         # 0 表示不超时
         self._timeout_s = timeout_s
 
     # 对工具名 + 参数执行硬/软规则评估（无缓存、无挂起）
     def evaluate(self, tool_name: str, params: dict[str, Any]) -> PermissionDecision:
+        from weavecode.core.permissions.policy import evaluate_hard, evaluate_soft
         policy = self._policies.get(tool_name)
         if policy is None:
             return _UNKNOWN_TOOL_DEFAULT
-        hard = _evaluate_hard(tool_name, params, policy)
+        hard = evaluate_hard(tool_name, params, policy)
         if hard is not None:
             return hard
-        return _evaluate_soft(tool_name, params, policy)
+        return evaluate_soft(tool_name, params, policy)
 
     # 检查权限；越界或需 ask 时向客户端发事件并等待响应
     async def check_and_wait(
@@ -113,7 +111,7 @@ class PermissionManager:
         if hard == PermissionDecision.DENY:
             return PermissionResult(False, "auto_deny", tool_name, "")
         if hard == PermissionDecision.ASK:
-            # 黑名单命中的命令：强制审批，且排在缓存之前 → 不可被「始终允许」绕过
+            # 危险命令（黑名单）：强制审批，且排在缓存之前 → 不可被「始终允许」绕过
             return await self._ask_and_wait(
                 tool_use_id, tool_name, params, session_id, event_emitter,
                 permission=tool_name, resource="*", project=working_dir,
@@ -207,7 +205,7 @@ class PermissionManager:
             logger.info("permission: timeout tool_use_id=%s tool=%s", tool_use_id, tool_name)
             return PermissionResult(False, "timeout", permission, resource)
 
-        allowed = self._apply_response(raw, session_id, permission, project, resource)
+        allowed = await self._apply_response(raw, session_id, permission, project, resource)
         return PermissionResult(allowed, raw, permission, resource)
 
     # 处理客户端返回的审批决策，resolve 对应 Future
@@ -220,7 +218,7 @@ class PermissionManager:
             req.future.set_result(decision)
 
     # 应用审批决策：更新会话缓存与持久化规则；返回是否放行
-    def _apply_response(
+    async def _apply_response(
         self, decision: str, session_id: str, permission: str, project: str, resource: str
     ) -> bool:
         allow = decision in ("allow_once", "always_allow")
@@ -234,19 +232,17 @@ class PermissionManager:
         rule = (project, permission, save_resource)
         if rule not in self._saved:
             self._saved.append(rule)
-        if self._policy_file is not None:
+        if self._db is not None:
             try:
-                save_policy_file(self._saved, self._policy_file)
+                await save_rule(self._db, rule)
                 logger.info(
                     "permission: always allow saved permission=%s resource=%s project=%s",
                     permission, save_resource, project,
                 )
             except Exception:
-                logger.exception(
-                    "permission: failed to write policy file path=%s", self._policy_file
-                )
+                logger.exception("permission: failed to save rule db=%s", self._db.path)
         else:
-            logger.warning("permission: policy_file is None, skipping persistence")
+            logger.warning("permission: db is None, skipping persistence")
         return allow
 
     # 客户端断连时拒绝该 session 所有待审批请求，防止 Future 永久挂起
