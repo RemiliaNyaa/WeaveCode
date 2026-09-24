@@ -25,6 +25,7 @@ from weavecode.core.session.store import SessionStore
 from weavecode.core.subagent.runs import BackgroundRuns
 from weavecode.core.subagent.tool import SpawnAgentTool
 from weavecode.core.subagent.wait_tool import WaitAgentTool
+from weavecode.core.storage.database import Database
 from weavecode.core.tools.base import BaseTool
 from weavecode.core.trace.provider import TracingProvider
 from weavecode.core.trace.writer import TraceWriter
@@ -70,6 +71,7 @@ class AgentRunner:
         trace: TraceWriter | None = None,
         permission_manager: PermissionManager | None = None,
         mcp_manager: McpServerManager | None = None,
+        db: Database | None = None,
         runs_dir: Path | None = None,
     ) -> None:
         self._config = config
@@ -79,6 +81,7 @@ class AgentRunner:
         self._trace = trace
         self._permission_manager = permission_manager
         self._mcp_manager = mcp_manager
+        self._db = db
         self._runs_dir = runs_dir if runs_dir is not None else RUNS_DIR
 
     # 执行一次 agent run（委托给 run_and_capture）
@@ -143,8 +146,8 @@ class AgentRunner:
         # 后台子 Agent 登记表：wait_agent 与收工兜底都靠它，整个 run 共用一份
         runs = BackgroundRuns()
 
-        # 事件文件用 async with 打开：无论正常结束、报错还是被中断都会正确关闭
-        async with EventWriter(run_path / "events.jsonl") as writer:
+        # 事件流改由带数据库句柄的写入器落库，不再写 runs/<run_id>/events.jsonl
+        async with EventWriter(self._db, run_id) as writer:
             writer.subscribe(bus)
             await bus.publish(RunStartedEvent(run_id=run_id, goal=goal, ts=_now()))
 
@@ -284,6 +287,7 @@ class AgentRunner:
                     child_tools=lambda: self._builtin_tools(NoopPlanStorage()),
                     mcp_tools=mcp_tools,
                     runs=runs,
+                    db=self._db,
                 )
             )
             registry.register(WaitAgentTool(runs))

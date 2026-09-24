@@ -54,5 +54,34 @@ def _migration_1(conn: sqlite3.Connection) -> None:
         conn.execute(statement)
 
 
+# 迁移 2：事件流（对齐 opencode 的 event / event_sequence）
+#
+# 为什么 event_sequence 单独一张表：JSONL 靠「行序」天然有序，DB 里必须**显式存序号**；
+# 序号又要在事务里原子地「读最大值 → +1 → 写回」，所以单独一行（run_id 主键）承载它。
+_STATEMENTS_2 = (
+    "CREATE TABLE event_sequence ("
+    "  run_id TEXT PRIMARY KEY,"
+    "  seq INTEGER NOT NULL"  # 该 run 已分配到的最大序号
+    ")",
+    "CREATE TABLE event ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  run_id TEXT NOT NULL REFERENCES event_sequence(run_id) ON DELETE CASCADE,"
+    "  seq INTEGER NOT NULL,"
+    "  type TEXT NOT NULL,"  # 事件类型，如 tool.call_started
+    "  data TEXT NOT NULL,"  # 事件完整 JSON（回放时原样还原）
+    "  time_created INTEGER NOT NULL"
+    ")",
+    "CREATE UNIQUE INDEX event_run_seq_idx ON event(run_id, seq)",
+    "CREATE INDEX event_run_type_idx ON event(run_id, type, seq)",
+)
+
+
+# 建 event / event_sequence 两张表
+def _migration_2(conn: sqlite3.Connection) -> None:
+    for statement in _STATEMENTS_2:
+        conn.execute(statement)
+
+
 # 注册迁移（版本号从 1 起，只往后追加）
 MIGRATIONS.append((1, "session_and_messages", _migration_1))
+MIGRATIONS.append((2, "event_stream", _migration_2))

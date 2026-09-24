@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import datetime
 import fnmatch
-import json
 import logging
 import signal
 import sys
@@ -40,12 +39,13 @@ from weavecode.core.bus.commands import (
 from weavecode.core.bus.envelope import EventPushEnvelope
 from weavecode.core.config import WeaveConfig, get_config
 from weavecode.core.events.bus import EventBus
+from weavecode.core.events.writer import read_events
 from weavecode.core.llm.provider import AnthropicProvider
 from weavecode.core.logging_setup import setup_logging
 from weavecode.core.mcp.server import McpServerManager
 from weavecode.core.permissions.manager import PermissionManager
 from weavecode.core.runner import AgentRunner
-from weavecode.core.runs import events_file, new_run_id
+from weavecode.core.runs import new_run_id
 from weavecode.core.session import SessionManager, SessionStore
 from weavecode.core.storage import Database, apply_migrations
 from weavecode.core.trace.record import TraceRecord
@@ -214,22 +214,18 @@ class CoreApp:
         sub_id = self._broadcaster.subscribe(writer, cmd.topics, cmd.scope)
         return EventSubscribeResult(subscription_id=sub_id, replayed_count=replayed_count)
 
-    # 从事件文件向 writer 回放匹配 topic 的历史事件，返回已回放条数
+    # 从 event 表向 writer 回放匹配 topic 的历史事件，返回已回放条数
     async def _replay_events(
         self,
         run_id: str,
         writer: asyncio.StreamWriter,
         topics: list[str],
     ) -> int:
-        path = events_file(run_id)
-        if not path.exists():
-            path = self._find_run_events(run_id)
-            if path is None:
-                return 0
+        if self._db is None:
+            return 0
 
         count = 0
-        for line in path.read_text().splitlines():
-            event = json.loads(line)
+        for event in await read_events(self._db, run_id):
             event_type = str(event.get("type", ""))
             if not any(fnmatch.fnmatch(event_type, p) for p in topics):
                 continue
@@ -240,15 +236,6 @@ class CoreApp:
         if count:
             await writer.drain()
         return count
-
-    # 会话化之后 run 目录挂在会话下面，老位置找不到时按会话目录兜底扫一遍
-    @staticmethod
-    def _find_run_events(run_id: str) -> Path | None:
-        sessions_root = Path.home() / ".weave" / "sessions"
-        if not sessions_root.exists():
-            return None
-        matches = sorted(sessions_root.glob(f"*/runs/{run_id}/events.jsonl"))
-        return matches[0] if matches else None
 
     # 启动守护进程：加载配置、初始化日志、启动 trace、启动 TCP 服务器，并等待退出信号
     async def run(self) -> None:
@@ -295,6 +282,7 @@ class CoreApp:
                 trace=self._trace,
                 permission_manager=self._permission_manager,
                 mcp_manager=self._mcp_manager,
+                db=self._db,
             ),
             bus=self._bus,
             provider=compact_provider,
@@ -303,7 +291,10 @@ class CoreApp:
 
         if self._config.mcp.servers:
             logger.info("mcp: starting %d server(s)", len(self._config.mcp.servers))
-            await self._mcp_manager.start_all(self._config.mcp.servers)
+            await self._mcp_manager.start_all(
+                self._config.mcp.servers,
+                refresh_on_notify=self._config.mcp.refresh_on_notify,
+            )
 
         server = SocketServer(
             self._config.host,
