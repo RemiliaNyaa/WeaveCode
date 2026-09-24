@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from weavecode.core.storage import migrations
 from weavecode.core.storage.database import DEFAULT_DB_PATH, Database
 
 
@@ -44,7 +45,7 @@ async def test_run_executes_and_reuses_connection(tmp_path: Path) -> None:
     await db.run(lambda c: c.execute("INSERT INTO t VALUES ('x')"))
     rows = await db.run(lambda c: c.execute("SELECT v FROM t").fetchall())
 
-    assert [r[0] for r in rows] == ["x"]
+    assert [r["v"] for r in rows] == ["x"]
 
 
 # 功能：transaction 提交后数据可见
@@ -57,7 +58,7 @@ async def test_transaction_commits(tmp_path: Path) -> None:
     await db.transaction(lambda c: c.execute("INSERT INTO t VALUES ('y')"))
 
     rows = await db.run(lambda c: c.execute("SELECT v FROM t").fetchall())
-    assert [r[0] for r in rows] == ["y"]
+    assert [r["v"] for r in rows] == ["y"]
 
 
 # 功能：transaction 抛异常时整段回滚，不留半截数据
@@ -96,3 +97,55 @@ async def test_run_serializes_concurrent_calls(tmp_path: Path) -> None:
     spans.sort()
     for (_, end), (next_start, _) in zip(spans, spans[1:]):
         assert end <= next_start, "两次 run 的占用区间重叠了 —— 锁没起作用"
+
+
+# 功能：迁移按版本号递增执行，且重复调用不会重复跑
+# 设计：临时塞两条迁移、跑两次——第一次返回 [1,2]、第二次返回 []，
+#       锁住「记账 + 幂等」这条不变式（否则每次启动都会重建表）
+@pytest.mark.asyncio
+async def test_migrations_apply_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[int] = []
+
+    def first(conn: sqlite3.Connection) -> None:
+        calls.append(1)
+        conn.execute("CREATE TABLE a (v TEXT)")
+
+    def second(conn: sqlite3.Connection) -> None:
+        calls.append(2)
+        conn.execute("CREATE TABLE b (v TEXT)")
+
+    monkeypatch.setattr(migrations, "MIGRATIONS", [(1, "one", first), (2, "two", second)])
+    db = _db(tmp_path)
+
+    first_run = await migrations.apply_migrations(db)
+    second_run = await migrations.apply_migrations(db)
+
+    assert first_run == [1, 2]
+    assert second_run == []
+    assert calls == [1, 2]
+    ids = await db.run(
+        lambda c: [r[0] for r in c.execute("SELECT id FROM migration ORDER BY id")]
+    )
+    assert ids == [1, 2]
+
+
+# 功能：迁移失败时回滚，且不记账（下次启动会重试）
+# 设计：让迁移建了表再抛——断言异常抛出、记账为空、表没留下，保证不会停在「半迁移」状态
+@pytest.mark.asyncio
+async def test_migration_failure_rolls_back(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def bad(conn: sqlite3.Connection) -> None:
+        conn.execute("CREATE TABLE half (v TEXT)")
+        raise RuntimeError("bad migration")
+
+    monkeypatch.setattr(migrations, "MIGRATIONS", [(1, "bad", bad)])
+    db = _db(tmp_path)
+
+    with pytest.raises(RuntimeError):
+        await migrations.apply_migrations(db)
+
+    ids = await db.run(lambda c: [r[0] for r in c.execute("SELECT id FROM migration")])
+    assert ids == []
+    tables = await db.run(
+        lambda c: [r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")]
+    )
+    assert "half" not in tables

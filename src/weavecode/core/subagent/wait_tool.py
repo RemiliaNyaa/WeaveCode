@@ -13,7 +13,7 @@ class WaitAgentParams(BaseModel):
     run_ids: list[str] | None = None
 
 
-# 阻塞等待后台子 Agent 出结果；省略 run_ids 表示等仍在跑的
+# 阻塞等待后台子 Agent 出结果；省略 run_ids 表示等全部未完成的
 class WaitAgentTool(BaseTool):
     name = "wait_agent"
     description = (
@@ -49,18 +49,19 @@ class WaitAgentTool(BaseTool):
     def __init__(self, runs: BackgroundRuns) -> None:
         self._runs = runs
 
-    # 阻塞等待指定（或仍在跑的）后台子 Agent，把各自结果拼成文本返回
+    # 阻塞等待指定（或全部未完成）的后台子 Agent，把各自结果拼成文本返回
     async def invoke(self, params: dict[str, object]) -> ToolResult:
         p = WaitAgentParams.model_validate(params)
-        targets = list(p.run_ids) if p.run_ids else self._runs.pending_ids()
+        targets = p.run_ids or None
 
-        if not targets:
-            return ToolResult(content="No background sub-agent is still running.")
+        if targets is None and not self._runs.known_ids():
+            return ToolResult(content="No background sub-agents were started.")
 
         outcomes = await self._runs.wait(targets)
         if not outcomes:
+            known = ", ".join(self._runs.known_ids()) or "none"
             return ToolResult(
-                content=f"No background sub-agent matched run_ids={p.run_ids}.",
+                content=f"No background sub-agent matched run_ids={targets}. Known runs: {known}.",
                 is_error=True,
                 error_type="runtime_error",
             )

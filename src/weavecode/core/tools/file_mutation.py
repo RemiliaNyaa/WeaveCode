@@ -99,21 +99,18 @@ async def _uninterruptible(awaitable: Awaitable[T]) -> T:
 
 # 所有写文件操作的唯一入口：按规范化路径取锁 → 在独立线程里跑完整段「读 → 改 → 写」
 #
-# 工具自己不锁，统一交给这里锁 —— 从机制上消除「谁忘了加锁」。
+# 工具自己不锁，统一交给这里锁 —— 从机制上消除「谁忘了加锁」（对齐 OpenCode V2 的 FileMutation）。
 class FileMutation:
     def __init__(self, locks: PathLocks | None = None) -> None:
         self._locks = locks or PathLocks()
 
     # 整文件覆盖写（不存在则创建，自动建父目录）
-    # 兼容期：早期调用方直接传字符串路径，统一在这里转成 Path
-    async def write(self, path: Path | str, content: str) -> None:
-        target = path if isinstance(path, Path) else Path(path)
-        await self._run(target, lambda: _write_sync(target, content))
+    async def write(self, path: Path, content: str) -> None:
+        await self._run(path, lambda: _write_sync(path, content))
 
     # 读 → 改 → 写：transform 拿到文件当前文本，返回要写回的新文本；抛异常则中止不写
-    async def edit(self, path: Path | str, transform: Callable[[str], str]) -> None:
-        target = path if isinstance(path, Path) else Path(path)
-        await self._run(target, lambda: _edit_sync(target, transform))
+    async def edit(self, path: Path, transform: Callable[[str], str]) -> None:
+        await self._run(path, lambda: _edit_sync(path, transform))
 
     # 在指定文件的锁内、在线程里执行一段同步逻辑（整段读改写一口气跑完，中间不让出）
     async def _run(self, path: Path, action: Callable[[], T]) -> T:
