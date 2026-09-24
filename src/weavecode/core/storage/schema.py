@@ -82,6 +82,31 @@ def _migration_2(conn: sqlite3.Connection) -> None:
         conn.execute(statement)
 
 
+# 迁移 4：任务列表（对齐 opencode 的 todo）
+#
+# **只换介质，不改维度**——现有 PlanItem 就是 (step, status) 两个字段（写在 tasks.json 里），
+# 迁到 DB 后仍是这两列 + 一个 seq 保顺序，不趁机加 priority / id / 时间戳等新维度。
+# session_id 用外键：任务列表本来就属于某个 session（manager 也是按 session 缓存它的）。
+_STATEMENTS_4 = (
+    "CREATE TABLE todo ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  session_id TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE,"
+    "  seq INTEGER NOT NULL,"  # 同一次保存内的顺序
+    "  step TEXT NOT NULL,"  # 任务描述
+    "  status TEXT NOT NULL,"  # pending | in_progress | completed
+    "  time_created INTEGER NOT NULL"
+    ")",
+    "CREATE INDEX todo_session_idx ON todo(session_id, seq)",
+)
+
+
+# 建 todo 表
+def _migration_4(conn: sqlite3.Connection) -> None:
+    for statement in _STATEMENTS_4:
+        conn.execute(statement)
+
+
 # 注册迁移（版本号从 1 起，只往后追加）
 MIGRATIONS.append((1, "session_and_messages", _migration_1))
 MIGRATIONS.append((2, "event_stream", _migration_2))
+MIGRATIONS.append((4, "todo", _migration_4))

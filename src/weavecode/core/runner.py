@@ -38,7 +38,7 @@ from weavecode.core.tools.builtin import (
     WriteFileTool,
 )
 from weavecode.core.tools.builtin.update_plan import (
-    FilePlanStorage,
+    DbPlanStorage,
     NoopPlanStorage,
     PlanStorage,
     UpdatePlanTool,
@@ -105,10 +105,6 @@ class AgentRunner:
             working_dir = (
                 session.effective_working_dir() if session is not None else str(Path.cwd())
             )
-        # 会话与消息已入库：运行目录只剩事件文件与计划文件两个用途
-        run_path = self._runs_dir / run_id
-        run_path.mkdir(parents=True, exist_ok=True)
-
         # 恢复历史改成就地等待落库的异步读取；无会话时从 goal 起一份全新历史
         if session is not None and store is not None:
             history = await store.read_messages(session.id)
@@ -135,12 +131,13 @@ class AgentRunner:
             working_dir=working_dir,
         )
 
-        # 计划存储：调用方注入时跨 run 复用同一份；否则全量覆盖写进会话的任务目录
+        # 优先用外部注入的 PlanStorage（SessionManager 按 session 缓存的同一实例）；
+        # 未注入时：有 session 且有 db 就落 todo 表，否则 Noop（无 session 的场景不持久化）
         if plan_storage is None:
-            tasks_dir = run_path / ".tasks"
-            if session is not None:
-                tasks_dir = Path("~/.weave/sessions").expanduser() / session.id / ".tasks"
-            plan_storage = FilePlanStorage(tasks_dir)
+            if session is not None and self._db is not None:
+                plan_storage = DbPlanStorage(self._db, session.id)
+            else:
+                plan_storage = NoopPlanStorage()
         session_id = session.id if session is not None else ""
 
         # 后台子 Agent 登记表：wait_agent 与收工兜底都靠它，整个 run 共用一份

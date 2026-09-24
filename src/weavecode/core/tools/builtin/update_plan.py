@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-import json
-from pathlib import Path
+import sqlite3
+import time
 from typing import Protocol
 
 from pydantic import BaseModel, ConfigDict
 
+from weavecode.core.storage.database import Database
 from weavecode.core.tools.base import BaseTool, ToolResult
 
 _SUCCEEDED_MSG = "任务列表更新成功"
@@ -22,31 +23,39 @@ class UpdatePlanParams(BaseModel):
     tasks: list[PlanItem]
 
 
-# 计划存储后端抽象：主 Agent 写文件、子 Agent 空操作，由构造方注入
+# 计划存储后端抽象：主 Agent 落库、子 Agent 空操作，由构造方注入
 class PlanStorage(Protocol):
-    # 保存任务列表；实现方决定是否落盘
-    def save(self, tasks: list[PlanItem]) -> None: ...
+    # 保存任务列表；实现方决定是否落库
+    async def save(self, tasks: list[PlanItem]) -> None: ...
 
 
-# 主 Agent 后端：把任务列表全量覆盖写入 {dir}/tasks.json
-class FilePlanStorage:
-    def __init__(self, directory: Path) -> None:
-        self._file = directory / "tasks.json"
+# 主 Agent 后端：把任务列表全量覆盖写入 todo 表
+class DbPlanStorage:
+    def __init__(self, db: Database, session_id: str) -> None:
+        self._db = db
+        self._session_id = session_id
 
-    # 全量覆盖写入 JSON 文件（自动创建父目录），无校验直接落盘
-    def save(self, tasks: list[PlanItem]) -> None:
-        self._file.parent.mkdir(parents=True, exist_ok=True)
-        data = [{"step": t.step, "status": t.status} for t in tasks]
-        self._file.write_text(
-            json.dumps(data, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+    # 全量覆盖保存（DELETE 旧行 → 按 seq 插入新行），两步必须同一事务
+    async def save(self, tasks: list[PlanItem]) -> None:
+        session_id = self._session_id
+        now = int(time.time() * 1000)
+
+        def _replace(conn: sqlite3.Connection) -> None:
+            conn.execute("DELETE FROM todo WHERE session_id = ?", (session_id,))
+            for seq, item in enumerate(tasks):
+                conn.execute(
+                    "INSERT INTO todo (session_id, seq, step, status, time_created) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (session_id, seq, item.step, item.status, now),
+                )
+
+        await self._db.transaction(_replace)
 
 
-# 子 Agent 后端：不落盘，什么都不做（返回永远成功）
+# 子 Agent 后端：不落库，什么都不做（返回永远成功）
 class NoopPlanStorage:
-    # 空操作：子 Agent 的任务列表不写入任何文件
-    def save(self, tasks: list[PlanItem]) -> None:
+    # 空操作：子 Agent 的任务列表不写入任何存储
+    async def save(self, tasks: list[PlanItem]) -> None:
         return
 
 
@@ -98,12 +107,12 @@ class UpdatePlanTool(BaseTool):
         "required": ["tasks"],
     }
 
-    # 持有 PlanStorage 实例（主 Agent 传 File、子 Agent 传 Noop），供 invoke 调用
+    # 持有 PlanStorage 实例（主 Agent 传 Db、子 Agent 传 Noop），供 invoke 调用
     def __init__(self, storage: PlanStorage) -> None:
         self._storage = storage
 
     # 全量保存任务列表到注入的后端；不校验状态，永远返回"任务列表更新成功"
     async def invoke(self, params: dict[str, object]) -> ToolResult:
         p = UpdatePlanParams.model_validate(params)
-        self._storage.save(p.tasks)
+        await self._storage.save(p.tasks)
         return ToolResult(content=_SUCCEEDED_MSG)
