@@ -44,6 +44,7 @@ from weavecode.core.llm.provider import AnthropicProvider
 from weavecode.core.logging_setup import setup_logging
 from weavecode.core.mcp.server import McpServerManager
 from weavecode.core.permissions.manager import PermissionManager
+from weavecode.core.permissions.storage import load_policy
 from weavecode.core.runner import AgentRunner
 from weavecode.core.runs import new_run_id
 from weavecode.core.session import SessionManager, SessionStore
@@ -251,16 +252,6 @@ class CoreApp:
 
         self._broadcaster = IpcEventBroadcaster(trace=self._trace)
         self._bus.subscribe(self._broadcaster.handle)
-
-        # 权限规则由管理器启动时自己读回，超时秒数走配置
-        self._permission_manager = PermissionManager(
-            timeout_s=self._config.permission.timeout_s,
-        )
-        logger.info(
-            "permission manager: timeout_s=%.1f",
-            self._config.permission.timeout_s,
-        )
-
         # 打开 SQLite 并跑迁移；旧的文件式存储已作废（见《数据存储迁移到 SQLite：执行计划》）
         self._db = Database()
         ran = await apply_migrations(self._db)
@@ -268,10 +259,28 @@ class CoreApp:
             logger.info("db: applied %d migration(s): %s", len(ran), ran)
         store = SessionStore(self._db)
 
-        assert self._config is not None
-        compact_provider = AnthropicProvider(self._config.llm.default_model)
+        # 持久化权限规则从 permission 表读（原来是 ~/.weave/policy.toml）；
+        # 先读出来再交给 manager，manager 的构造函数因此不再做 I/O
+        saved_rules = await load_policy(self._db)
+        self._permission_manager = PermissionManager(
+            db=self._db,
+            saved=saved_rules,
+            timeout_s=self._config.permission.timeout_s,
+        )
+        logger.info(
+            "permission manager: timeout_s=%.1f  persistent=%d entries",
+            self._config.permission.timeout_s,
+            len(saved_rules),
+        )
 
-        # MCP manager 先建对象：run 的 registry 工厂要靠它取工具
+        assert self._config is not None
+        compact_provider = AnthropicProvider(
+            self._config.llm.default_model,
+            max_retries=self._config.llm.stream_retries,
+        )
+
+        # MCP manager 先建对象（run 的 registry 工厂要靠它取工具），但**不在这里连 server** ——
+        # 连接挪到 server.start() 之后，理由见那段注释
         self._mcp_manager = McpServerManager()
 
         self._sessions = SessionManager(
@@ -288,13 +297,6 @@ class CoreApp:
             provider=compact_provider,
             compaction_keep_tokens=self._config.compaction.keep_tokens,
         )
-
-        if self._config.mcp.servers:
-            logger.info("mcp: starting %d server(s)", len(self._config.mcp.servers))
-            await self._mcp_manager.start_all(
-                self._config.mcp.servers,
-                refresh_on_notify=self._config.mcp.refresh_on_notify,
-            )
 
         server = SocketServer(
             self._config.host,
@@ -317,8 +319,18 @@ class CoreApp:
         logger.info("weave-core %s listening addr=%s", weavecode.__version__, addr)
         logger.info("config: %s", self._config)
 
-        shutdown = asyncio.Event()
+        # ★ 先 listen 再连 MCP：MCP 是**外部依赖**（可能是远程 server），连它要几次网络往返。
+        # 若放在 listen 之前，一个慢/挂的远程 server 会让本地 daemon 迟迟不可连（实测 7~25s）。
+        # 放在这里：端口先可用、客户端能立刻连上；await 期间事件循环照常处理请求。
+        if self._config.mcp.servers:
+            logger.info("mcp: starting %d server(s)", len(self._config.mcp.servers))
+            await self._mcp_manager.start_all(
+                self._config.mcp.servers,
+                refresh_on_notify=self._config.mcp.refresh_on_notify,
+            )
+
         loop = asyncio.get_running_loop()
+        shutdown = asyncio.Event()
         # Windows 上 asyncio 不支持 add_signal_handler，降级为 signal.signal
         if sys.platform == "win32":
             signal.signal(signal.SIGINT, lambda *_: shutdown.set())
