@@ -3,6 +3,7 @@
 __pycache__/
 *.pyc
 *.pyo
+runs/
 dist/
 build/
 *.egg-info/
@@ -14,5 +15,6 @@ uv.lock
 .idea/
 .DS_Store
 *.log
+workspace/
 .weave/config.json
 .weave/mcp_server.py
